@@ -1,0 +1,8 @@
+/build/
+/backend/whatfast-backend
+/desktop/target/
+*.db
+*.db-shm
+*.db-wal
+*.log
+

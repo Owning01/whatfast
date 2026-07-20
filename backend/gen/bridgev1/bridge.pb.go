@@ -338,6 +338,7 @@ type RpcRequest struct {
 	//	*RpcRequest_SearchLocal
 	//	*RpcRequest_OpenContact
 	//	*RpcRequest_ListMessagesAround
+	//	*RpcRequest_SendSticker
 	Request       isRpcRequest_Request `protobuf_oneof:"request"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -542,6 +543,15 @@ func (x *RpcRequest) GetListMessagesAround() *ListMessagesAroundRequest {
 	return nil
 }
 
+func (x *RpcRequest) GetSendSticker() *SendStickerRequest {
+	if x != nil {
+		if x, ok := x.Request.(*RpcRequest_SendSticker); ok {
+			return x.SendSticker
+		}
+	}
+	return nil
+}
+
 type isRpcRequest_Request interface {
 	isRpcRequest_Request()
 }
@@ -618,6 +628,10 @@ type RpcRequest_ListMessagesAround struct {
 	ListMessagesAround *ListMessagesAroundRequest `protobuf:"bytes,18,opt,name=list_messages_around,json=listMessagesAround,proto3,oneof"`
 }
 
+type RpcRequest_SendSticker struct {
+	SendSticker *SendStickerRequest `protobuf:"bytes,19,opt,name=send_sticker,json=sendSticker,proto3,oneof"`
+}
+
 func (*RpcRequest_Hello) isRpcRequest_Request() {}
 
 func (*RpcRequest_GetAuthState) isRpcRequest_Request() {}
@@ -654,6 +668,8 @@ func (*RpcRequest_OpenContact) isRpcRequest_Request() {}
 
 func (*RpcRequest_ListMessagesAround) isRpcRequest_Request() {}
 
+func (*RpcRequest_SendSticker) isRpcRequest_Request() {}
+
 type RpcResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Exactly one result is always set: either an error or a successful payload.
@@ -679,6 +695,7 @@ type RpcResponse struct {
 	//	*RpcResponse_SearchLocal
 	//	*RpcResponse_OpenContact
 	//	*RpcResponse_ListMessagesAround
+	//	*RpcResponse_SendSticker
 	Result        isRpcResponse_Result `protobuf_oneof:"result"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -892,6 +909,15 @@ func (x *RpcResponse) GetListMessagesAround() *ListMessagesAroundResponse {
 	return nil
 }
 
+func (x *RpcResponse) GetSendSticker() *SendStickerResponse {
+	if x != nil {
+		if x, ok := x.Result.(*RpcResponse_SendSticker); ok {
+			return x.SendSticker
+		}
+	}
+	return nil
+}
+
 type isRpcResponse_Result interface {
 	isRpcResponse_Result()
 }
@@ -972,6 +998,10 @@ type RpcResponse_ListMessagesAround struct {
 	ListMessagesAround *ListMessagesAroundResponse `protobuf:"bytes,27,opt,name=list_messages_around,json=listMessagesAround,proto3,oneof"`
 }
 
+type RpcResponse_SendSticker struct {
+	SendSticker *SendStickerResponse `protobuf:"bytes,28,opt,name=send_sticker,json=sendSticker,proto3,oneof"`
+}
+
 func (*RpcResponse_Error) isRpcResponse_Result() {}
 
 func (*RpcResponse_Hello) isRpcResponse_Result() {}
@@ -1009,6 +1039,8 @@ func (*RpcResponse_SearchLocal) isRpcResponse_Result() {}
 func (*RpcResponse_OpenContact) isRpcResponse_Result() {}
 
 func (*RpcResponse_ListMessagesAround) isRpcResponse_Result() {}
+
+func (*RpcResponse_SendSticker) isRpcResponse_Result() {}
 
 type BackendEvent struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -4906,6 +4938,120 @@ func (x *BackendProblem) GetFatal() bool {
 	return false
 }
 
+type SendStickerRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Stable UUID with the same idempotency contract as other sends.
+	ClientMessageId string `protobuf:"bytes,1,opt,name=client_message_id,json=clientMessageId,proto3" json:"client_message_id,omitempty"`
+	ChatId          string `protobuf:"bytes,2,opt,name=chat_id,json=chatId,proto3" json:"chat_id,omitempty"`
+	// A complete WhatsApp-compatible WebP file prepared by the desktop.
+	WebpData         []byte `protobuf:"bytes,3,opt,name=webp_data,json=webpData,proto3" json:"webp_data,omitempty"`
+	ReplyToMessageId string `protobuf:"bytes,4,opt,name=reply_to_message_id,json=replyToMessageId,proto3" json:"reply_to_message_id,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *SendStickerRequest) Reset() {
+	*x = SendStickerRequest{}
+	mi := &file_bridge_proto_msgTypes[63]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SendStickerRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SendStickerRequest) ProtoMessage() {}
+
+func (x *SendStickerRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_bridge_proto_msgTypes[63]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SendStickerRequest.ProtoReflect.Descriptor instead.
+func (*SendStickerRequest) Descriptor() ([]byte, []int) {
+	return file_bridge_proto_rawDescGZIP(), []int{63}
+}
+
+func (x *SendStickerRequest) GetClientMessageId() string {
+	if x != nil {
+		return x.ClientMessageId
+	}
+	return ""
+}
+
+func (x *SendStickerRequest) GetChatId() string {
+	if x != nil {
+		return x.ChatId
+	}
+	return ""
+}
+
+func (x *SendStickerRequest) GetWebpData() []byte {
+	if x != nil {
+		return x.WebpData
+	}
+	return nil
+}
+
+func (x *SendStickerRequest) GetReplyToMessageId() string {
+	if x != nil {
+		return x.ReplyToMessageId
+	}
+	return ""
+}
+
+type SendStickerResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Message       *Message               `protobuf:"bytes,1,opt,name=message,proto3" json:"message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SendStickerResponse) Reset() {
+	*x = SendStickerResponse{}
+	mi := &file_bridge_proto_msgTypes[64]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SendStickerResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SendStickerResponse) ProtoMessage() {}
+
+func (x *SendStickerResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_bridge_proto_msgTypes[64]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SendStickerResponse.ProtoReflect.Descriptor instead.
+func (*SendStickerResponse) Descriptor() ([]byte, []int) {
+	return file_bridge_proto_rawDescGZIP(), []int{64}
+}
+
+func (x *SendStickerResponse) GetMessage() *Message {
+	if x != nil {
+		return x.Message
+	}
+	return nil
+}
+
 var File_bridge_proto protoreflect.FileDescriptor
 
 const file_bridge_proto_rawDesc = "" +
@@ -4919,7 +5065,7 @@ const file_bridge_proto_rawDesc = "" +
 	" \x01(\v2\x1e.whatfast.bridge.v1.RpcRequestH\x00R\arequest\x12=\n" +
 	"\bresponse\x18\v \x01(\v2\x1f.whatfast.bridge.v1.RpcResponseH\x00R\bresponse\x128\n" +
 	"\x05event\x18\f \x01(\v2 .whatfast.bridge.v1.BackendEventH\x00R\x05eventB\x06\n" +
-	"\x04body\"\xa8\v\n" +
+	"\x04body\"\xf5\v\n" +
 	"\n" +
 	"RpcRequest\x128\n" +
 	"\x05hello\x18\x01 \x01(\v2 .whatfast.bridge.v1.HelloRequestH\x00R\x05hello\x12O\n" +
@@ -4942,8 +5088,9 @@ const file_bridge_proto_rawDesc = "" +
 	"\x11get_message_image\x18\x0f \x01(\v2*.whatfast.bridge.v1.GetMessageImageRequestH\x00R\x0fgetMessageImage\x12K\n" +
 	"\fsearch_local\x18\x10 \x01(\v2&.whatfast.bridge.v1.SearchLocalRequestH\x00R\vsearchLocal\x12K\n" +
 	"\fopen_contact\x18\x11 \x01(\v2&.whatfast.bridge.v1.OpenContactRequestH\x00R\vopenContact\x12a\n" +
-	"\x14list_messages_around\x18\x12 \x01(\v2-.whatfast.bridge.v1.ListMessagesAroundRequestH\x00R\x12listMessagesAroundB\t\n" +
-	"\arequest\"\xe6\v\n" +
+	"\x14list_messages_around\x18\x12 \x01(\v2-.whatfast.bridge.v1.ListMessagesAroundRequestH\x00R\x12listMessagesAround\x12K\n" +
+	"\fsend_sticker\x18\x13 \x01(\v2&.whatfast.bridge.v1.SendStickerRequestH\x00R\vsendStickerB\t\n" +
+	"\arequest\"\xb4\f\n" +
 	"\vRpcResponse\x124\n" +
 	"\x05error\x18\x01 \x01(\v2\x1c.whatfast.bridge.v1.RpcErrorH\x00R\x05error\x129\n" +
 	"\x05hello\x18\n" +
@@ -4967,7 +5114,8 @@ const file_bridge_proto_rawDesc = "" +
 	"\x11get_message_image\x18\x18 \x01(\v2+.whatfast.bridge.v1.GetMessageImageResponseH\x00R\x0fgetMessageImage\x12L\n" +
 	"\fsearch_local\x18\x19 \x01(\v2'.whatfast.bridge.v1.SearchLocalResponseH\x00R\vsearchLocal\x12L\n" +
 	"\fopen_contact\x18\x1a \x01(\v2'.whatfast.bridge.v1.OpenContactResponseH\x00R\vopenContact\x12b\n" +
-	"\x14list_messages_around\x18\x1b \x01(\v2..whatfast.bridge.v1.ListMessagesAroundResponseH\x00R\x12listMessagesAroundB\b\n" +
+	"\x14list_messages_around\x18\x1b \x01(\v2..whatfast.bridge.v1.ListMessagesAroundResponseH\x00R\x12listMessagesAround\x12L\n" +
+	"\fsend_sticker\x18\x1c \x01(\v2'.whatfast.bridge.v1.SendStickerResponseH\x00R\vsendStickerB\b\n" +
 	"\x06result\"\xbe\x06\n" +
 	"\fBackendEvent\x12\x1a\n" +
 	"\bsequence\x18\x01 \x01(\x04R\bsequence\x12V\n" +
@@ -5256,7 +5404,14 @@ const file_bridge_proto_rawDesc = "" +
 	"\x0eBackendProblem\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\tR\x04code\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12\x14\n" +
-	"\x05fatal\x18\x03 \x01(\bR\x05fatal*\xb0\x02\n" +
+	"\x05fatal\x18\x03 \x01(\bR\x05fatal\"\xa5\x01\n" +
+	"\x12SendStickerRequest\x12*\n" +
+	"\x11client_message_id\x18\x01 \x01(\tR\x0fclientMessageId\x12\x17\n" +
+	"\achat_id\x18\x02 \x01(\tR\x06chatId\x12\x1b\n" +
+	"\twebp_data\x18\x03 \x01(\fR\bwebpData\x12-\n" +
+	"\x13reply_to_message_id\x18\x04 \x01(\tR\x10replyToMessageId\"L\n" +
+	"\x13SendStickerResponse\x125\n" +
+	"\amessage\x18\x01 \x01(\v2\x1b.whatfast.bridge.v1.MessageR\amessage*\xb0\x02\n" +
 	"\x0fConnectionState\x12 \n" +
 	"\x1cCONNECTION_STATE_UNSPECIFIED\x10\x00\x12\x1d\n" +
 	"\x19CONNECTION_STATE_STARTING\x10\x01\x12\x1c\n" +
@@ -5293,7 +5448,7 @@ func file_bridge_proto_rawDescGZIP() []byte {
 }
 
 var file_bridge_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_bridge_proto_msgTypes = make([]protoimpl.MessageInfo, 63)
+var file_bridge_proto_msgTypes = make([]protoimpl.MessageInfo, 65)
 var file_bridge_proto_goTypes = []any{
 	(ConnectionState)(0),                  // 0: whatfast.bridge.v1.ConnectionState
 	(ChatKind)(0),                         // 1: whatfast.bridge.v1.ChatKind
@@ -5361,6 +5516,8 @@ var file_bridge_proto_goTypes = []any{
 	(*MessageUpserted)(nil),               // 63: whatfast.bridge.v1.MessageUpserted
 	(*ReceiptUpdated)(nil),                // 64: whatfast.bridge.v1.ReceiptUpdated
 	(*BackendProblem)(nil),                // 65: whatfast.bridge.v1.BackendProblem
+	(*SendStickerRequest)(nil),            // 66: whatfast.bridge.v1.SendStickerRequest
+	(*SendStickerResponse)(nil),           // 67: whatfast.bridge.v1.SendStickerResponse
 }
 var file_bridge_proto_depIdxs = []int32{
 	4,  // 0: whatfast.bridge.v1.Envelope.request:type_name -> whatfast.bridge.v1.RpcRequest
@@ -5384,67 +5541,70 @@ var file_bridge_proto_depIdxs = []int32{
 	18, // 18: whatfast.bridge.v1.RpcRequest.search_local:type_name -> whatfast.bridge.v1.SearchLocalRequest
 	22, // 19: whatfast.bridge.v1.RpcRequest.open_contact:type_name -> whatfast.bridge.v1.OpenContactRequest
 	24, // 20: whatfast.bridge.v1.RpcRequest.list_messages_around:type_name -> whatfast.bridge.v1.ListMessagesAroundRequest
-	7,  // 21: whatfast.bridge.v1.RpcResponse.error:type_name -> whatfast.bridge.v1.RpcError
-	9,  // 22: whatfast.bridge.v1.RpcResponse.hello:type_name -> whatfast.bridge.v1.HelloResponse
-	11, // 23: whatfast.bridge.v1.RpcResponse.auth_state:type_name -> whatfast.bridge.v1.AuthStateResponse
-	13, // 24: whatfast.bridge.v1.RpcResponse.start_pairing:type_name -> whatfast.bridge.v1.StartPairingResponse
-	15, // 25: whatfast.bridge.v1.RpcResponse.list_chats:type_name -> whatfast.bridge.v1.ListChatsResponse
-	17, // 26: whatfast.bridge.v1.RpcResponse.list_messages:type_name -> whatfast.bridge.v1.ListMessagesResponse
-	27, // 27: whatfast.bridge.v1.RpcResponse.send_text:type_name -> whatfast.bridge.v1.SendTextResponse
-	33, // 28: whatfast.bridge.v1.RpcResponse.mark_read:type_name -> whatfast.bridge.v1.MarkReadResponse
-	35, // 29: whatfast.bridge.v1.RpcResponse.logout:type_name -> whatfast.bridge.v1.LogoutResponse
-	37, // 30: whatfast.bridge.v1.RpcResponse.shutdown:type_name -> whatfast.bridge.v1.ShutdownResponse
-	39, // 31: whatfast.bridge.v1.RpcResponse.get_chat_avatar:type_name -> whatfast.bridge.v1.GetChatAvatarResponse
-	41, // 32: whatfast.bridge.v1.RpcResponse.send_reaction:type_name -> whatfast.bridge.v1.SendReactionResponse
-	43, // 33: whatfast.bridge.v1.RpcResponse.get_participant_avatar:type_name -> whatfast.bridge.v1.GetParticipantAvatarResponse
-	45, // 34: whatfast.bridge.v1.RpcResponse.repair_recent_reactions:type_name -> whatfast.bridge.v1.RepairRecentReactionsResponse
-	29, // 35: whatfast.bridge.v1.RpcResponse.send_image:type_name -> whatfast.bridge.v1.SendImageResponse
-	31, // 36: whatfast.bridge.v1.RpcResponse.get_message_image:type_name -> whatfast.bridge.v1.GetMessageImageResponse
-	21, // 37: whatfast.bridge.v1.RpcResponse.search_local:type_name -> whatfast.bridge.v1.SearchLocalResponse
-	23, // 38: whatfast.bridge.v1.RpcResponse.open_contact:type_name -> whatfast.bridge.v1.OpenContactResponse
-	25, // 39: whatfast.bridge.v1.RpcResponse.list_messages_around:type_name -> whatfast.bridge.v1.ListMessagesAroundResponse
-	59, // 40: whatfast.bridge.v1.BackendEvent.connection_changed:type_name -> whatfast.bridge.v1.ConnectionChanged
-	60, // 41: whatfast.bridge.v1.BackendEvent.pairing_qr:type_name -> whatfast.bridge.v1.PairingQr
-	61, // 42: whatfast.bridge.v1.BackendEvent.sync_progress:type_name -> whatfast.bridge.v1.SyncProgress
-	62, // 43: whatfast.bridge.v1.BackendEvent.chat_upserted:type_name -> whatfast.bridge.v1.ChatUpserted
-	63, // 44: whatfast.bridge.v1.BackendEvent.message_upserted:type_name -> whatfast.bridge.v1.MessageUpserted
-	64, // 45: whatfast.bridge.v1.BackendEvent.receipt_updated:type_name -> whatfast.bridge.v1.ReceiptUpdated
-	65, // 46: whatfast.bridge.v1.BackendEvent.problem:type_name -> whatfast.bridge.v1.BackendProblem
-	49, // 47: whatfast.bridge.v1.BackendEvent.reaction_updated:type_name -> whatfast.bridge.v1.ReactionUpdated
-	50, // 48: whatfast.bridge.v1.BackendEvent.recent_reactions_repaired:type_name -> whatfast.bridge.v1.RecentReactionsRepaired
-	51, // 49: whatfast.bridge.v1.BackendEvent.chat_merged:type_name -> whatfast.bridge.v1.ChatMerged
-	0,  // 50: whatfast.bridge.v1.AuthStateResponse.connection_state:type_name -> whatfast.bridge.v1.ConnectionState
-	46, // 51: whatfast.bridge.v1.ListChatsResponse.chats:type_name -> whatfast.bridge.v1.Chat
-	47, // 52: whatfast.bridge.v1.ListMessagesResponse.messages:type_name -> whatfast.bridge.v1.Message
-	46, // 53: whatfast.bridge.v1.MessageSearchResult.chat:type_name -> whatfast.bridge.v1.Chat
-	19, // 54: whatfast.bridge.v1.SearchLocalResponse.contacts:type_name -> whatfast.bridge.v1.ContactSearchResult
-	46, // 55: whatfast.bridge.v1.SearchLocalResponse.groups:type_name -> whatfast.bridge.v1.Chat
-	20, // 56: whatfast.bridge.v1.SearchLocalResponse.messages:type_name -> whatfast.bridge.v1.MessageSearchResult
-	46, // 57: whatfast.bridge.v1.OpenContactResponse.chat:type_name -> whatfast.bridge.v1.Chat
-	47, // 58: whatfast.bridge.v1.ListMessagesAroundResponse.messages:type_name -> whatfast.bridge.v1.Message
-	47, // 59: whatfast.bridge.v1.SendTextResponse.message:type_name -> whatfast.bridge.v1.Message
-	47, // 60: whatfast.bridge.v1.SendImageResponse.message:type_name -> whatfast.bridge.v1.Message
-	48, // 61: whatfast.bridge.v1.SendReactionResponse.reaction:type_name -> whatfast.bridge.v1.Reaction
-	1,  // 62: whatfast.bridge.v1.Chat.kind:type_name -> whatfast.bridge.v1.ChatKind
-	2,  // 63: whatfast.bridge.v1.Message.status:type_name -> whatfast.bridge.v1.MessageStatus
-	48, // 64: whatfast.bridge.v1.Message.reactions:type_name -> whatfast.bridge.v1.Reaction
-	52, // 65: whatfast.bridge.v1.Message.text:type_name -> whatfast.bridge.v1.TextContent
-	58, // 66: whatfast.bridge.v1.Message.unsupported:type_name -> whatfast.bridge.v1.UnsupportedContent
-	53, // 67: whatfast.bridge.v1.Message.image:type_name -> whatfast.bridge.v1.ImageContent
-	54, // 68: whatfast.bridge.v1.Message.attachment:type_name -> whatfast.bridge.v1.AttachmentContent
-	56, // 69: whatfast.bridge.v1.Message.contacts:type_name -> whatfast.bridge.v1.ContactsContent
-	57, // 70: whatfast.bridge.v1.Message.location:type_name -> whatfast.bridge.v1.LocationContent
-	48, // 71: whatfast.bridge.v1.ReactionUpdated.reaction:type_name -> whatfast.bridge.v1.Reaction
-	55, // 72: whatfast.bridge.v1.ContactsContent.contacts:type_name -> whatfast.bridge.v1.ContactContent
-	0,  // 73: whatfast.bridge.v1.ConnectionChanged.state:type_name -> whatfast.bridge.v1.ConnectionState
-	46, // 74: whatfast.bridge.v1.ChatUpserted.chat:type_name -> whatfast.bridge.v1.Chat
-	47, // 75: whatfast.bridge.v1.MessageUpserted.message:type_name -> whatfast.bridge.v1.Message
-	2,  // 76: whatfast.bridge.v1.ReceiptUpdated.status:type_name -> whatfast.bridge.v1.MessageStatus
-	77, // [77:77] is the sub-list for method output_type
-	77, // [77:77] is the sub-list for method input_type
-	77, // [77:77] is the sub-list for extension type_name
-	77, // [77:77] is the sub-list for extension extendee
-	0,  // [0:77] is the sub-list for field type_name
+	66, // 21: whatfast.bridge.v1.RpcRequest.send_sticker:type_name -> whatfast.bridge.v1.SendStickerRequest
+	7,  // 22: whatfast.bridge.v1.RpcResponse.error:type_name -> whatfast.bridge.v1.RpcError
+	9,  // 23: whatfast.bridge.v1.RpcResponse.hello:type_name -> whatfast.bridge.v1.HelloResponse
+	11, // 24: whatfast.bridge.v1.RpcResponse.auth_state:type_name -> whatfast.bridge.v1.AuthStateResponse
+	13, // 25: whatfast.bridge.v1.RpcResponse.start_pairing:type_name -> whatfast.bridge.v1.StartPairingResponse
+	15, // 26: whatfast.bridge.v1.RpcResponse.list_chats:type_name -> whatfast.bridge.v1.ListChatsResponse
+	17, // 27: whatfast.bridge.v1.RpcResponse.list_messages:type_name -> whatfast.bridge.v1.ListMessagesResponse
+	27, // 28: whatfast.bridge.v1.RpcResponse.send_text:type_name -> whatfast.bridge.v1.SendTextResponse
+	33, // 29: whatfast.bridge.v1.RpcResponse.mark_read:type_name -> whatfast.bridge.v1.MarkReadResponse
+	35, // 30: whatfast.bridge.v1.RpcResponse.logout:type_name -> whatfast.bridge.v1.LogoutResponse
+	37, // 31: whatfast.bridge.v1.RpcResponse.shutdown:type_name -> whatfast.bridge.v1.ShutdownResponse
+	39, // 32: whatfast.bridge.v1.RpcResponse.get_chat_avatar:type_name -> whatfast.bridge.v1.GetChatAvatarResponse
+	41, // 33: whatfast.bridge.v1.RpcResponse.send_reaction:type_name -> whatfast.bridge.v1.SendReactionResponse
+	43, // 34: whatfast.bridge.v1.RpcResponse.get_participant_avatar:type_name -> whatfast.bridge.v1.GetParticipantAvatarResponse
+	45, // 35: whatfast.bridge.v1.RpcResponse.repair_recent_reactions:type_name -> whatfast.bridge.v1.RepairRecentReactionsResponse
+	29, // 36: whatfast.bridge.v1.RpcResponse.send_image:type_name -> whatfast.bridge.v1.SendImageResponse
+	31, // 37: whatfast.bridge.v1.RpcResponse.get_message_image:type_name -> whatfast.bridge.v1.GetMessageImageResponse
+	21, // 38: whatfast.bridge.v1.RpcResponse.search_local:type_name -> whatfast.bridge.v1.SearchLocalResponse
+	23, // 39: whatfast.bridge.v1.RpcResponse.open_contact:type_name -> whatfast.bridge.v1.OpenContactResponse
+	25, // 40: whatfast.bridge.v1.RpcResponse.list_messages_around:type_name -> whatfast.bridge.v1.ListMessagesAroundResponse
+	67, // 41: whatfast.bridge.v1.RpcResponse.send_sticker:type_name -> whatfast.bridge.v1.SendStickerResponse
+	59, // 42: whatfast.bridge.v1.BackendEvent.connection_changed:type_name -> whatfast.bridge.v1.ConnectionChanged
+	60, // 43: whatfast.bridge.v1.BackendEvent.pairing_qr:type_name -> whatfast.bridge.v1.PairingQr
+	61, // 44: whatfast.bridge.v1.BackendEvent.sync_progress:type_name -> whatfast.bridge.v1.SyncProgress
+	62, // 45: whatfast.bridge.v1.BackendEvent.chat_upserted:type_name -> whatfast.bridge.v1.ChatUpserted
+	63, // 46: whatfast.bridge.v1.BackendEvent.message_upserted:type_name -> whatfast.bridge.v1.MessageUpserted
+	64, // 47: whatfast.bridge.v1.BackendEvent.receipt_updated:type_name -> whatfast.bridge.v1.ReceiptUpdated
+	65, // 48: whatfast.bridge.v1.BackendEvent.problem:type_name -> whatfast.bridge.v1.BackendProblem
+	49, // 49: whatfast.bridge.v1.BackendEvent.reaction_updated:type_name -> whatfast.bridge.v1.ReactionUpdated
+	50, // 50: whatfast.bridge.v1.BackendEvent.recent_reactions_repaired:type_name -> whatfast.bridge.v1.RecentReactionsRepaired
+	51, // 51: whatfast.bridge.v1.BackendEvent.chat_merged:type_name -> whatfast.bridge.v1.ChatMerged
+	0,  // 52: whatfast.bridge.v1.AuthStateResponse.connection_state:type_name -> whatfast.bridge.v1.ConnectionState
+	46, // 53: whatfast.bridge.v1.ListChatsResponse.chats:type_name -> whatfast.bridge.v1.Chat
+	47, // 54: whatfast.bridge.v1.ListMessagesResponse.messages:type_name -> whatfast.bridge.v1.Message
+	46, // 55: whatfast.bridge.v1.MessageSearchResult.chat:type_name -> whatfast.bridge.v1.Chat
+	19, // 56: whatfast.bridge.v1.SearchLocalResponse.contacts:type_name -> whatfast.bridge.v1.ContactSearchResult
+	46, // 57: whatfast.bridge.v1.SearchLocalResponse.groups:type_name -> whatfast.bridge.v1.Chat
+	20, // 58: whatfast.bridge.v1.SearchLocalResponse.messages:type_name -> whatfast.bridge.v1.MessageSearchResult
+	46, // 59: whatfast.bridge.v1.OpenContactResponse.chat:type_name -> whatfast.bridge.v1.Chat
+	47, // 60: whatfast.bridge.v1.ListMessagesAroundResponse.messages:type_name -> whatfast.bridge.v1.Message
+	47, // 61: whatfast.bridge.v1.SendTextResponse.message:type_name -> whatfast.bridge.v1.Message
+	47, // 62: whatfast.bridge.v1.SendImageResponse.message:type_name -> whatfast.bridge.v1.Message
+	48, // 63: whatfast.bridge.v1.SendReactionResponse.reaction:type_name -> whatfast.bridge.v1.Reaction
+	1,  // 64: whatfast.bridge.v1.Chat.kind:type_name -> whatfast.bridge.v1.ChatKind
+	2,  // 65: whatfast.bridge.v1.Message.status:type_name -> whatfast.bridge.v1.MessageStatus
+	48, // 66: whatfast.bridge.v1.Message.reactions:type_name -> whatfast.bridge.v1.Reaction
+	52, // 67: whatfast.bridge.v1.Message.text:type_name -> whatfast.bridge.v1.TextContent
+	58, // 68: whatfast.bridge.v1.Message.unsupported:type_name -> whatfast.bridge.v1.UnsupportedContent
+	53, // 69: whatfast.bridge.v1.Message.image:type_name -> whatfast.bridge.v1.ImageContent
+	54, // 70: whatfast.bridge.v1.Message.attachment:type_name -> whatfast.bridge.v1.AttachmentContent
+	56, // 71: whatfast.bridge.v1.Message.contacts:type_name -> whatfast.bridge.v1.ContactsContent
+	57, // 72: whatfast.bridge.v1.Message.location:type_name -> whatfast.bridge.v1.LocationContent
+	48, // 73: whatfast.bridge.v1.ReactionUpdated.reaction:type_name -> whatfast.bridge.v1.Reaction
+	55, // 74: whatfast.bridge.v1.ContactsContent.contacts:type_name -> whatfast.bridge.v1.ContactContent
+	0,  // 75: whatfast.bridge.v1.ConnectionChanged.state:type_name -> whatfast.bridge.v1.ConnectionState
+	46, // 76: whatfast.bridge.v1.ChatUpserted.chat:type_name -> whatfast.bridge.v1.Chat
+	47, // 77: whatfast.bridge.v1.MessageUpserted.message:type_name -> whatfast.bridge.v1.Message
+	2,  // 78: whatfast.bridge.v1.ReceiptUpdated.status:type_name -> whatfast.bridge.v1.MessageStatus
+	47, // 79: whatfast.bridge.v1.SendStickerResponse.message:type_name -> whatfast.bridge.v1.Message
+	80, // [80:80] is the sub-list for method output_type
+	80, // [80:80] is the sub-list for method input_type
+	80, // [80:80] is the sub-list for extension type_name
+	80, // [80:80] is the sub-list for extension extendee
+	0,  // [0:80] is the sub-list for field type_name
 }
 
 func init() { file_bridge_proto_init() }
@@ -5476,6 +5636,7 @@ func file_bridge_proto_init() {
 		(*RpcRequest_SearchLocal)(nil),
 		(*RpcRequest_OpenContact)(nil),
 		(*RpcRequest_ListMessagesAround)(nil),
+		(*RpcRequest_SendSticker)(nil),
 	}
 	file_bridge_proto_msgTypes[2].OneofWrappers = []any{
 		(*RpcResponse_Error)(nil),
@@ -5497,6 +5658,7 @@ func file_bridge_proto_init() {
 		(*RpcResponse_SearchLocal)(nil),
 		(*RpcResponse_OpenContact)(nil),
 		(*RpcResponse_ListMessagesAround)(nil),
+		(*RpcResponse_SendSticker)(nil),
 	}
 	file_bridge_proto_msgTypes[3].OneofWrappers = []any{
 		(*BackendEvent_ConnectionChanged)(nil),
@@ -5524,7 +5686,7 @@ func file_bridge_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_bridge_proto_rawDesc), len(file_bridge_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   63,
+			NumMessages:   65,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

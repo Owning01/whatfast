@@ -12,6 +12,7 @@ import (
 	"github.com/Owning01/whatfast/backend/internal/app"
 	"github.com/Owning01/whatfast/backend/internal/bridge"
 	"github.com/Owning01/whatfast/backend/internal/logging"
+	"github.com/Owning01/whatfast/backend/internal/profilelock"
 	"github.com/Owning01/whatfast/backend/internal/securefs"
 	"github.com/Owning01/whatfast/backend/internal/store"
 	"github.com/Owning01/whatfast/backend/internal/wa"
@@ -43,6 +44,11 @@ func run() error {
 	if err = securefs.EnsurePrivateDirectory(abs); err != nil {
 		return err
 	}
+	profile, err := profilelock.Acquire(abs)
+	if err != nil {
+		return err
+	}
+	defer profile.Close()
 	log, closer, err := logging.New(logFile)
 	if err != nil {
 		return err

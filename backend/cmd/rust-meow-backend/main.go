@@ -12,6 +12,7 @@ import (
 	"github.com/Owning01/whatfast/backend/internal/app"
 	"github.com/Owning01/whatfast/backend/internal/bridge"
 	"github.com/Owning01/whatfast/backend/internal/logging"
+	"github.com/Owning01/whatfast/backend/internal/securefs"
 	"github.com/Owning01/whatfast/backend/internal/store"
 	"github.com/Owning01/whatfast/backend/internal/wa"
 )
@@ -39,7 +40,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	if err = os.MkdirAll(abs, 0o700); err != nil {
+	if err = securefs.EnsurePrivateDirectory(abs); err != nil {
 		return err
 	}
 	log, closer, err := logging.New(logFile)

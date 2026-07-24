@@ -79,7 +79,9 @@ export default function App() {
         >
           <TitleBar model={model} />
           <nav class="nav-rail" aria-label="Primary navigation">
-            <div class="brand-mark" aria-label="Whatfast"><span style={{ "font-weight": 900 }}>M</span></div>
+            <div class="brand-mark" aria-label="Whatfast">
+              <MessageCircle size={22} />
+            </div>
             <IconButton
               label="Chats"
               active={state.chatFilter !== "archived"}

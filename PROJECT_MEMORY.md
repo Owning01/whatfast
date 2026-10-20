@@ -173,7 +173,7 @@ duración ni tamaño, así que la UI no lo podía detectar como GIF.
   del repositorio en `tauri/src-tauri/Cargo.toml`, el fixture de test de
   iniciales de avatar y los nombres de muestra de los datos de prueba. No
   queda una sola coincidencia del nombre viejo fuera del paquete upstream
-  `whatsmeow`, ni en el árbol actual ni en los 211 commits del historial.
+  `whatsmeow`, ni en el árbol actual ni en los 210 commits del historial.
 - Set completo de íconos regenerado con `tauri icon` desde el logo de
   Whatfast (PNG 1024 de Flow): `.ico`, `.icns`, PNG de 32 a 512, los
   `Square*Logo` de Windows y las carpetas `android/` e `ios/`.

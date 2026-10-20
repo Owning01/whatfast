@@ -132,14 +132,14 @@ Cómo se midió, para que puedas repetirlo:
 ## Dónde Whatfast gana de verdad
 
 1. **No te descarga un segundo navegador.** La app usa el WebView2 que ya
-   viene con Windows. La app oficial de Windows trae su propio Chromium
-   (Electron): son cientos de megabytes de motor duplicado en el disco.
+   viene con Windows. La app oficial de Windows, en cambio, trae su propio
+   Chromium (Electron) en el instalador, en vez de reusar el del sistema.
 2. **No necesita el navegador abierto.** WhatsApp Web es una pestaña más: si
    tenés 40 pestañas, la de WhatsApp se lleva su parte de RAM y de CPU. Acá
    la app son 57,4 MB de código propio y nada más.
 3. **La UI pesa 411 KB.** La pantalla de login de WhatsApp Web ya baja 5,8 MB
-   de JavaScript; la app oficial pesa mucho más porque va con un Chromium
-   entero adentro.
+   de JavaScript; la app oficial viene con un motor entero adentro, así que su
+   cliente es de otra escala.
 4. **Arranca antes.** Ventana visible a los 0,25 s y lista de chats a los
    1,16 s, sin depender de la red.
 5. **El historial es tuyo y es local.** SQLite en tu disco, con control de

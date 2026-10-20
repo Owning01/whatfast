@@ -217,3 +217,64 @@ el nombre viejo no correspondía a la marca.
   imagen del README se rompe.
 - `tauri/node_modules` sigue roto: `make deps` y `make build` fallan en el
   repo hasta que se repare el volumen o se reinicie la máquina.
+
+## 2026-10-20 — README nuevo con benchmarks medidos, capturas de la UI y auditoría de datos
+
+**Qué se cambió**
+
+- `README.md` reescrito en español: qué es la app, ocho capturas de la UI con
+  chats y contactos mockeados, tabla comparativa contra WhatsApp Web y contra
+  la app de Windows, sección de "dónde gana" y de "dónde todavía pierde",
+  arquitectura, privacidad, compilación y protocolo.
+- Ocho capturas en `docs/screenshots/`: lista de chats, conversación con foto
+  y nota de voz, grupo con video, nota de voz, búsqueda sobre contactos y
+  mensajes, ficha del contacto, editor de imagen y picker de emoji. Se
+  sacaron con un Chromium headless propio contra el modo mock del repo, así
+  que no tocan la sesión del navegador del usuario.
+- `LICENSE-MIT` y `LICENSE-APACHE`: el repo declaraba la licencia dual en los
+  `Cargo.toml` pero no tenía los archivos.
+- Se sacaron las 3 rutas absolutas con el nombre de usuario de esta máquina
+  que quedaban en `PROJECT_MAP.md`, `PROJECT_MEMORY.md` y
+  `docs/WA_DESKTOP_FEATURE_BASELINE.md`.
+
+**Por qué**
+
+El README viejo describía la arquitectura y no decía nada de por qué usar esta
+app en vez de WhatsApp Web o la app de Windows. La comparación tiene que
+apoyarse en números, y los números tienen que estar medidos, no estimados.
+
+**Evidencia**
+
+- Todo el árbol y los 214 commits auditados: sin tokens, sin API keys, sin
+  claves privadas, sin credenciales en URL, sin `.env`/`.pem`/`.key`, sin
+  bases de datos ni logs versionados, sin artefactos de build. Los únicos
+  correos son el del autor y JID de prueba (`@s.whatsapp.net`).
+- Tree publicado: 284 archivos, 3,9 MB, el más grande es el `.pb.go`
+  generado (386 KB).
+- Mediciones del 20/10/2026 en esta máquina: ventana visible a los 0,25 s;
+  lista de chats a los 1,16 s (build de desarrollo, Chromium headless);
+  núcleo Rust 25,6 MB, sidecar Go 31,8 MB, WebView2 366,8 MB, total 432 MB;
+  UI 411 KB (127 KB gzip). WhatsApp Web en el mismo Chromium headless: FCP
+  0,91 s, `load` 3,50 s, 5.948 KB de JS solo la pantalla de login, 79 MB de
+  heap JS. Brave con 6 pestañas: 612,7 MB.
+- La app de Windows no está instalada en esta máquina: sus celdas quedan sin
+  medir y la diferencia se explica por estructura (trae su propio Chromium),
+  no con un número inventado.
+
+**Trampas**
+
+- El modo mock del navegador solo existe en build de desarrollo
+  (`import.meta.env.DEV`): el bundle de producción sin Tauri no muestra la
+  UI, así que el tiempo de pintado no se puede medir en el navegador con el
+  bundle de producción.
+- La página de WhatsApp Web rechaza el user agent de headless: hay que
+  falsearlo o devuelve "WhatsApp works with Google Chrome 100+".
+- La app real sí abre ventana y dibuja, pero en una sesión sin escritorio
+  visible hay que capturarla por `hwnd` (PrintWindow): con captura de
+  pantalla completa se captura lo que el usuario tiene abierto.
+
+**Pendiente**
+
+- La app de Windows sigue sin medirse en esta máquina.
+- El PNG de showcase del README viejo (un adjunto de usuario de GitHub de la
+  cuenta anterior) ya no está: el README nuevo usa capturas propias.

@@ -14,7 +14,8 @@ Built from static analysis artifacts of the real app (no runtime capture, no net
 | `viewmodels.txt` | 15 view models | Native view models |
 | `services.txt` | 103 services | Native services/handlers |
 
-All paths below are relative to `C:\Users\tu_usuario\AppData\Local\Temp\whatsapp_analysis\`.
+All paths below are relative to a local analysis directory (for example
+`%TEMP%\whatsapp_analysis\`).
 
 **Evidence notation**
 

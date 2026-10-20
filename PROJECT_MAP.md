@@ -84,7 +84,7 @@ Variables: `WHATFAST_BACKEND` (ruta del sidecar), `WHATFAST_DATA_DIR`
 - El toolchain de Go de `G:\Dev\GoLang` tiene el GOROOT incompleto (falta
   `src/go/build`). Compilar con `$env:GOTOOLCHAIN="go1.25.0"`.
 - MSVC sí está instalado (`G:\Dev\MSVC`), pero `link.exe` no está en el PATH
-  por defecto. Cargar `C:\Users\tu_usuario\AppData\Local\Temp\opencode\msvc.ps1`.
+  por defecto. Cargar el script `msvc.ps1` de la carpeta de herramientas.
 - `.cargo/config.toml` fija `rustc-wrapper = "sccache"` y sccache no está
   instalado. Compilar con `--config "build.rustc-wrapper=''"`.
 - `tauri/node_modules` está roto (instalación interrumpida). `pnpm check`,

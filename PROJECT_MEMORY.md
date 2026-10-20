@@ -208,7 +208,7 @@ el nombre viejo no correspondía a la marca.
 - `git filter-repo` no estaba instalado: se compiló `protoc-gen-go` desde el
   módulo cacheado de Go y se instaló `git-filter-repo` con pip.
 - El logo lo generó Flow (Nano Banana 2.1, no Pro: el panel no toma el chip
-  "Pro"). Quedó en `C:\Users\tu_usuario\Downloads\logo-whatsapp-fast\`.
+  "Pro"). Quedó en la carpeta de descargas, en `logo-whatsapp-fast\`.
 
 **Pendiente**
 

@@ -62,6 +62,12 @@ el aviso honesto de cobertura del historial.
 
 ![Conversación con foto y nota de voz](docs/screenshots/02-conversacion-fotos.png)
 
+### Nota de voz
+
+Reproducción con barra de progreso, velocidad y duración real del audio.
+
+![Nota de voz](docs/screenshots/04-nota-de-voz.png)
+
 ### Grupo con fotos, video y remitentes
 
 ![Grupo con fotos y video](docs/screenshots/03-grupo.png)

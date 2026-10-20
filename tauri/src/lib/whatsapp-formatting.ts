@@ -10,7 +10,8 @@ export type WhatsAppInlineStyle =
   | "italic"
   | "strikethrough"
   | "monospace"
-  | "inline-code";
+  | "inline-code"
+  | "spoiler";
 
 interface InlineSegmentBase {
   text: string;
@@ -215,7 +216,7 @@ function parseInline(
 
     const codeDelimiter = source.startsWith("```", index) ? "```" : source[index] === "`" ? "`" : "";
     if (codeDelimiter && isOpeningDelimiter(source, index, codeDelimiter.length)) {
-      const closing = findClosingCodeDelimiter(source, index + codeDelimiter.length, codeDelimiter);
+      const closing = findClosingMultiCharDelimiter(source, index + codeDelimiter.length, codeDelimiter);
       if (closing >= 0) {
         flushPlain(index);
         const content = source.slice(index + codeDelimiter.length, closing);
@@ -228,6 +229,25 @@ function parseInline(
           ],
         });
         index = closing + codeDelimiter.length;
+        plainStart = index;
+        continue;
+      }
+    }
+
+    // `||spoiler||` hides its content until the reader reveals it. It is a
+    // two-character delimiter, so it follows the same opening/closing rules
+    // as the code delimiters.
+    if (source.startsWith("||", index) && isOpeningDelimiter(source, index, 2)) {
+      const closing = findClosingMultiCharDelimiter(source, index + 2, "||");
+      if (closing >= 0) {
+        flushPlain(index);
+        const inner = source.slice(index + 2, closing);
+        const spoiler: WhatsAppInlineStyle = "spoiler";
+        const nestedStyles = styles.includes(spoiler) ? styles : [...styles, spoiler];
+        for (const segment of parseInline(inner, context, nestedStyles)) {
+          pushSegment(output, segment);
+        }
+        index = closing + 2;
         plainStart = index;
         continue;
       }
@@ -335,7 +355,7 @@ function findClosingStyleDelimiter(source: string, start: number, delimiter: str
   return -1;
 }
 
-function findClosingCodeDelimiter(source: string, start: number, delimiter: string): number {
+function findClosingMultiCharDelimiter(source: string, start: number, delimiter: string): number {
   let index = source.indexOf(delimiter, start);
   while (index >= 0) {
     if (isClosingDelimiter(source, index, delimiter.length)) return index;

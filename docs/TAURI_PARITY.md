@@ -44,8 +44,9 @@ release even if the visible UI appears correct.
   processes or read arbitrary local files.
 - Tauri and the sidecar communicate only through one coordinated protocol
   version using four-byte big-endian length, protobuf payload, and a maximum
-  frame size of 8 MiB. Forwarding and message editing advanced the wire contract to v16; both
-  processes must always be rebuilt together at that version.
+  frame size of 8 MiB. Forwarding, message editing, and the chat settings RPCs
+  advanced the wire contract to v21; both processes must always be rebuilt
+  together at that version.
 - `Hello` is the first request. Normal requests are not sent before its version
   handshake succeeds.
 - Request IDs correlate exactly one response. Timeouts, late responses, wrong
@@ -84,7 +85,10 @@ Known foundation blockers at this snapshot:
   there is no process epoch, automatic resync, or restart/backoff supervisor;
 - the asset protocol has an empty static scope and dynamically grants the
   active profile's media tree plus direct managed avatar files; Rust escape
-  tests pass, but cross-platform proof is still required;
+  tests pass, but cross-platform proof is still required. The static scope is
+  now empty (`[]`) instead of `["**"]`, and the core also grants the staging
+  caches (`staged-outgoing`, `pasted-images`, `voice-notes`) so the webview
+  can render a picture the user picked without being able to read the disk;
 - the backend repairs Unix profile directories to mode 0700 and sensitive
   files to 0600, and takes a cross-process advisory profile lock; Linux lock
   tests and an earlier packaged double-launch pass, while cross-platform focus
@@ -95,7 +99,7 @@ Known foundation blockers at this snapshot:
   must be accepted explicitly rather than inferred from the smaller size;
 - the Makefile now makes Tauri the default development/build/check path; GPUI
   regressions remain an explicit migration gate;
-- protocol v20 and attachment, poll, pinned-message, forward, edit, persisted sync-status, on-demand history, integrity, and repair RPCs are wired through the Go backend,
+- protocol v21 and attachment, poll, pinned-message, forward, edit, persisted sync-status, on-demand history, integrity, repair, and chat-settings (archive, mute, block) RPCs are wired through the Go backend,
   shared fake bridge, Tauri commands, and typed frontend, but the end-to-end
   document/audio/video gates remain unproven.
 
@@ -104,7 +108,7 @@ Known foundation blockers at this snapshot:
 | Capability | GPUI baseline | Tauri state | Proof required before cutover |
 | --- | --- | --- | --- |
 | Sidecar is sole state owner | GPUI | Core | **TR-01:** inspect open files while paired; only the Go PID may hold `session.db`/`client.db`; webview and Tauri code contain no SQL/session access. |
-| Protocol v16 Hello-first handshake | Shared GPUI bridge at v16 | Core | **TR-02:** both processes declare v16; valid Hello succeeds; request-before-Hello and incompatible versions fail closed in backend tests and a packaged-app smoke test. |
+| Protocol v21 Hello-first handshake | Shared GPUI bridge at v21 | Core | **TR-02:** both processes declare v21; valid Hello succeeds; request-before-Hello and incompatible versions fail closed in backend tests and a packaged-app smoke test. |
 | 8 MiB framed protobuf codec | GPUI | Core | **TR-03:** round-trip, zero-length, truncated, corrupt, and oversized frame tests pass on both sides. |
 | Concurrent request correlation | GPUI | Core | **TR-04:** issue mixed read/write RPCs with deliberately reordered responses; each promise completes once with its own response. |
 | Per-operation timeouts | GPUI | Core | **TR-05:** control/read/write stalls produce typed errors; late replies are ignored and pending entries are removed. |
@@ -173,7 +177,7 @@ Known foundation blockers at this snapshot:
 | Reply count and “view replies” jump | GPUI | Core data | **MS-06:** multiple replies update live, deletion/replay does not double count, and first-reply navigation is exact. |
 | Mentions rendered/resolved | GPUI | Core data | **MS-07:** outgoing encoded JIDs and incoming mentions display names while preserving copyable text and notification semantics. |
 | Linkification and safe external open | GPUI | Core opener permission | **MS-08:** only validated http/https URLs open; punctuation, IDN, malformed schemes, and untrusted message text cannot invoke Tauri. |
-| Link preview presentation | GPUI local presentation | UI required | **MS-09:** preview cannot make network requests to attacker-controlled URLs without an explicit privacy-reviewed backend path. |
+| Link preview presentation | GPUI local presentation | Core/UI: the backend resolves OpenGraph metadata for the first URL of a text message and the card renders title, description and URL | **MS-09:** the fetch happens in the sidecar, not in the webview, so the preview never makes the renderer talk to an attacker-controlled URL; a failed or oversized page degrades to the plain link. |
 | Reactions chips and reactor details | GPUI | Core command/events | **MS-10:** add/change/remove, optimistic races, retries, historical repair, counts, and sender identity converge. |
 | Typing and recording indicators | GPUI | Core command/event | **MS-11:** direct/group concurrent indicators expire, composing refreshes at the correct cadence, and stop on send/switch/blur. |
 | Chat/message live upsert | GPUI | Core event | **MS-12:** incoming message creates/reorders chat and appears once; updates do not reset scroll or discard hydrated media paths. |
@@ -196,11 +200,11 @@ Known foundation blockers at this snapshot:
 | Reply compose/cancel | GPUI | Core command | **CP-02:** capture target before async work; switching chats cannot send reply to the wrong conversation. |
 | Group mention picker | GPUI | Core chat-info command | **CP-03:** `@` filtering, keyboard/mouse selection, duplicate display names, deleted token, and exact JIDs pass. |
 | Emoji picker/search/categories/tones | GPUI | UI required | **CP-04:** complete supported catalog, skin tones, focus return, reaction/composer modes, and keyboard access pass. |
-| Send image with caption | GPUI | Core command/dialog | **CP-05:** picker cancellation, type/size/caption validation, upload progress/failure, reply capture, and native image message pass. |
+| Send image with caption | GPUI | Core command/dialog + `stage_outgoing_media` | **CP-05:** picker cancellation, type/size/caption validation, upload progress/failure, reply capture, and native image message pass. The picked file is validated and copied into the profile staging area by the desktop core, and only that copy can reach the backend. |
 | Send native sticker | GPUI | Core command/dialog | **CP-06:** off-thread conversion, static/animated constraints, wrong-chat race, timeout, and backend validation pass. |
 | Send/remove reaction | GPUI | Core command | **CP-07:** latest intent wins across rapid choices; retry uses stable action ID and stale responses cannot revert UI. |
 | Mark read through exact message | GPUI | Core command | **CP-08:** optimistic unread rollback on failure and group receipt context are correct. |
-| Paste/drag-drop image | Missing | Missing | **CP-09:** clipboard/drop validation enters the same preview/send path without granting broad filesystem access. |
+| Paste/drag-drop image | Missing | Core/UI: clipboard paste and drag-drop share the same staging and send path | **CP-09:** clipboard/drop validation enters the same preview/send path without granting broad filesystem access. |
 | Document attachment | Backend/Core/UI path | Implemented; proof pending | **CP-10:** upload, filename/MIME/size, caption, download/open/save, retry, history persistence, and registered typed Tauri calls. |
 | Video/GIF attachment and playback | Backend/Core/UI path | UI loops downloaded GIF-playback media inline and falls back to the OS player on codec failure; proof pending | **CP-11:** transcoding/thumbnail/duration, range playback, codec fallback, caption, bounded cache, and registered typed Tauri calls. |
 | Audio file and voice-note recording | Stored-attachment path; no recorder | Partial; recorder missing | **CP-12:** microphone permission, waveform/duration, cancel/lock/pause, upload, playback speed, seeking, background behavior, and registered typed Tauri calls. |
@@ -210,7 +214,8 @@ Known foundation blockers at this snapshot:
 | Delete for me/everyone | Missing | Missing | **CP-16:** eligibility/admin rules, confirmation, persistence, media-cache cleanup, and remote revoke result. |
 | Forward/share messages | Missing | Missing | **CP-17:** multi-select targets, forwarded metadata, media reuse/reupload, partial failure, and no wrong-chat sends. |
 | Retry failed outgoing message | Partial idempotency, no complete UI | Missing | **CP-18:** stable client ID prevents duplicates across timeout/restart and UI clearly exposes terminal versus retryable failure. |
-| Text formatting and spellcheck | Missing | Missing | **CP-19:** WhatsApp formatting semantics, platform spellcheck, shortcuts, paste, and literal-character escapes. |
+| Text formatting and spellcheck | Missing | Core/UI: inline bold, italic, strikethrough, monospace, inline code, spoiler (`\|\|…\|\|`) and the quote/list/code-block line forms | **CP-19:** WhatsApp formatting semantics, platform spellcheck, shortcuts, paste, and literal-character escapes. |
+| Edit picture before sending | Missing | Core/UI: `edit_image` in the desktop core (crop plus clockwise rotation) behind a modal editor | **CP-20:** the preview matches the produced pixels; the crop is expressed in the pixels of the rotated picture; animated pictures are refused instead of being silently flattened; markup, memes and video trimming are not implemented. |
 
 ## Chat and contact information
 
@@ -221,11 +226,11 @@ Known foundation blockers at this snapshot:
 | Participant list and avatars | GPUI | Core commands | **IN-03:** large group is scrollable/virtualized; roles/names/phones/avatars and privacy-denied images are correct. |
 | Disappearing timer display | GPUI | Core data | **IN-04:** off and supported durations render human-readable values. |
 | Set disappearing timer | Missing | Missing | **IN-05:** supported durations update remote/app state and emit system-state change. |
-| Archive/unarchive action | Read-only archived view | Missing | **IN-06:** mutation persists across devices and moves row between views without losing the active conversation. |
+| Archive/unarchive action | Read-only archived view | Core/UI: `set_chat_archive` RPC, optimistic update with rollback, row moves between views | **IN-06:** the linked-device transport exposes no app-state, so the flag is owned by this desktop profile; it does not sync to the phone and the scope must be stated in the release notes. |
 | Pin/unpin action | Sorts existing pinned state | Core/UI: admin-aware mutation, durable ordered pinned browser, unavailable-target fallback, exact navigation | **IN-07:** app-state limits/errors and ordering persist across restart. |
-| Mute/unmute action | Displays backend field indirectly | Missing | **IN-08:** duration/forever semantics drive notification suppression and app-state sync. |
+| Mute/unmute action | Displays backend field indirectly | Core/UI: `set_chat_mute` RPC with duration and forever semantics, optimistic update with rollback | **IN-08:** duration/forever semantics drive notification suppression; the "forever" case is stored as a far-future instant, and like archive it is desktop-profile scoped, not phone-synced. |
 | Clear/delete chat | Missing | Missing | **IN-09:** explicit confirmation, remote/local semantics, message/media cleanup, and selected-chat fallback pass. |
-| Block/unblock/report | Missing | Missing | **IN-10:** privacy state, reporting confirmation, transport errors, and composer availability update correctly. |
+| Block/unblock/report | Missing | Core/UI: `set_chat_block` RPC with a `blocked` column in the chat store, optimistic update with rollback; report is still missing | **IN-10:** the transport exposes no app-state, so the block list is owned by this desktop profile; reporting is out of scope for now. |
 | Create group | Missing | Missing | **IN-11:** contact selection, title/icon, creation failure/partial state, and resulting chat event. |
 | Group participant/admin management | Read-only participants | Missing | **IN-12:** add/remove/promote/demote permissions, pending approval, errors, and group events. |
 | Edit group title/about/icon | Read-only | Missing | **IN-13:** admin checks, upload/update, cache invalidation, and event convergence. |
@@ -241,8 +246,8 @@ silently excluded when declaring the migration complete.
 | --- | --- | --- |
 | Status/updates viewing and posting | Missing | **WA-01:** audience/privacy, text/media status, view receipts, expiry, mute, and history behavior. |
 | Channels/newsletters | Missing | **WA-02:** directory/subscription, live updates, reactions, mute, admin/posting, and notification behavior. |
-| One-to-one voice/video calls | **Upstream gap** | **WA-03:** whatsmeow currently lists calls as unimplemented. Implement a separately reviewed call stack or record an explicit product-scope exception; do not label it full parity. |
-| Group calls/call links/call history | **Upstream gap** | **WA-04:** signaling, WebRTC media, permissions, devices, ringing, reconnect, history, and security review. |
+| One-to-one voice/video calls | **Upstream gap** | **WA-03:** whatsmeow currently lists calls as unimplemented. Implement a separately reviewed call stack or record an explicit product-scope exception; do not label it full parity. **Recorded exception (2026-10-20):** the desktop shows an explicit "not supported" notice instead of a fake call screen, because the transport carries no signalling. |
+| Group calls/call links/call history | **Upstream gap** | **WA-04:** signalling, WebRTC media, permissions, devices, ringing, reconnect, history, and security review. **Recorded exception (2026-10-20):** same as WA-03. |
 | Communities and announcements | Missing | **WA-05:** full parent/child lifecycle and permissions, not merely chat rendering. |
 | Business/catalog/order surfaces | Incoming placeholders only | **WA-06:** define private-client scope or implement safe catalog/order rendering and actions. |
 | Broadcast lists | Upstream/WhatsApp Web limitations | **WA-07:** document upstream support and desktop comparison explicitly. |

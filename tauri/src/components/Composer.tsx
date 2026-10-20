@@ -4,19 +4,24 @@ import {
   FileImage,
   FileText,
   FileVideo,
+  Mic,
   Paperclip,
   Send,
   Smile,
   Sticker,
+  Square,
   X,
   ListChecks,
 } from "lucide-solid";
 import type { AppModel } from "../state/app";
-import { discardStagedImage, normalizeBridgeError, openFile, readClipboardText, stageClipboardImage } from "../lib/bridge";
+import { BridgeError, discardStagedImage, localFileName, normalizeBridgeError, openFile, readClipboardText, stageClipboardImage, stageVoiceNote } from "../lib/bridge";
 import { applyEmojiSuggestion, getEmojiAutocomplete } from "../lib/emoji-autocomplete";
+import { isPushToTalkContainer, webmOpusToOggOpus } from "../lib/voice-note";
 import { AttachmentKind, ChatKind, ConnectionState, type ChatParticipant } from "../lib/types";
-import { messageText } from "../lib/format";
+import { formatDuration, messageText } from "../lib/format";
+import { t } from "../lib/i18n";
 import { IconButton } from "./Primitives";
+import { MediaEditor } from "./MediaEditor";
 import { EMOJI_ENTRIES, EmojiPicker } from "./EmojiPicker";
 import { StickerTray } from "./StickerTray";
 import { ThemeIcon } from "./ThemeIcon";
@@ -33,8 +38,38 @@ export function Composer(props: { model: AppModel; chatId: string }) {
   const [pollQuestion, setPollQuestion] = createSignal("");
   const [pollOptions, setPollOptions] = createSignal("Yes\nNo");
   const [pollMultiple, setPollMultiple] = createSignal(false);
+  const [recording, setRecording] = createSignal(false);
+  const [recordedBlobUrl, setRecordedBlobUrl] = createSignal("");
+  const [recordingSeconds, setRecordingSeconds] = createSignal(0);
+  const [sendingVoice, setSendingVoice] = createSignal(false);
+  const [editor, setEditor] = createSignal<{ source: string; fileName: string } | null>(null);
   let textarea: HTMLTextAreaElement | undefined;
   let root: HTMLDivElement | undefined;
+  let mediaRecorder: MediaRecorder | undefined;
+  let recordedChunks: BlobPart[] = [];
+  let recordedMimeType = "";
+  let recordingTimer: number | undefined;
+  let analyser: AnalyserNode | undefined;
+  let analyserFrame: number | undefined;
+  let audioContext: AudioContext | undefined;
+  let audioStream: MediaStream | undefined;
+  let recordedBlob: Blob | undefined;
+  let recordedVoiceNote = false;
+  let sendOnStop = false;
+  // Set when the user cancels, so the asynchronous `onstop` callback knows to
+  // drop the final chunk instead of resurrecting a preview after cancel.
+  let discardRecording = false;
+  let disposed = false;
+
+  onCleanup(() => {
+    disposed = true;
+    if (recordingTimer !== undefined) window.clearInterval(recordingTimer);
+    if (analyserFrame !== undefined) cancelAnimationFrame(analyserFrame);
+    audioStream?.getTracks().forEach((track) => track.stop());
+    if (mediaRecorder && mediaRecorder.state !== "inactive") mediaRecorder.stop();
+    if (audioContext) void audioContext.close().catch(() => undefined);
+    if (recordedBlobUrl()) URL.revokeObjectURL(recordedBlobUrl());
+  });
 
   // Every read below is scoped to props.chatId, never to the globally
   // selected chat — this composer may live in a pane that is not focused,
@@ -190,8 +225,8 @@ export function Composer(props: { model: AppModel; chatId: string }) {
             rows={1}
             value={draft().text}
             disabled={!connected()}
-            placeholder={connected() ? (draft().editingMessageId ? "Edit message" : "Type a message") : "Waiting for connection…"}
-            aria-label="Message"
+            placeholder={connected() ? (draft().editingMessageId ? t("conversation.editMessage") : t("conversation.typeMessage")) : t("conversation.waitingConnection")}
+            aria-label={t("conversation.messageInput")}
             onInput={(event) => {
               actions.setDraftText(event.currentTarget.value, props.chatId);
               setComposerCaret(event.currentTarget.selectionStart ?? event.currentTarget.value.length);
@@ -269,6 +304,27 @@ export function Composer(props: { model: AppModel; chatId: string }) {
                   return;
                 }
               }
+              if ((event.ctrlKey || event.metaKey) && !event.altKey) {
+                const k = event.key.toLowerCase();
+                if (k === "b" || k === "i" || (event.shiftKey && (k === "s" || k === "x" || k === "m"))) {
+                  const target = event.currentTarget;
+                  const start = target.selectionStart;
+                  const end = target.selectionEnd;
+                  if (start !== null && end !== null && start !== end) {
+                    const wrap = k === "i" ? "_" : (k === "s" || k === "x") ? "~" : k === "m" ? "```" : "*";
+                    const currentText = draft().text;
+                    const selected = currentText.slice(start, end);
+                    const formatted = `${wrap}${selected}${wrap}`;
+                    const nextText = currentText.slice(0, start) + formatted + currentText.slice(end);
+                    actions.setDraftText(nextText, props.chatId);
+                    event.preventDefault();
+                    requestAnimationFrame(() => {
+                      target.setSelectionRange(start + wrap.length, end + wrap.length);
+                    });
+                    return;
+                  }
+                }
+              }
               if (event.key !== "Enter") return;
               const enterToSend = props.model.preferences.enterToSend;
               if (enterToSend) {
@@ -286,9 +342,52 @@ export function Composer(props: { model: AppModel; chatId: string }) {
           />
         </div>
 
+        <Show when={!recording() && !recordedBlobUrl()}>
+          <IconButton
+            label={t("composer.mic")}
+            class="mic-button"
+            disabled={!connected()}
+            onClick={() => void startVoiceRecording()}
+          >
+            <ThemeIcon icon={Mic} name="mic" size={22} />
+          </IconButton>
+        </Show>
+
+        <Show when={recording() || recordedBlobUrl()}>
+          <div class="voice-recorder" role="status">
+            <IconButton label={t("composer.cancelRecording")} onClick={cancelVoiceRecording}>
+              <X size={20} />
+            </IconButton>
+            <canvas class="voice-waveform" width={220} height={32} aria-label="Voice waveform" />
+            <span class="voice-recorder-time">{formatDuration(recordingSeconds())}</span>
+            <Show when={recording()}>
+              <IconButton label="Pause / Preview" disabled={sendingVoice()} onClick={() => stopVoiceRecording()}>
+                <Square size={16} />
+              </IconButton>
+              <IconButton
+                label={t("composer.sendVoiceNote")}
+                disabled={sendingVoice()}
+                onClick={() => void stopAndSendVoiceRecording()}
+              >
+                <ThemeIcon icon={Send} name="send" size={20} />
+              </IconButton>
+            </Show>
+            <Show when={recordedBlobUrl()}>
+              <audio controls preload="metadata" src={recordedBlobUrl()} aria-label="Recorded voice note" />
+              <IconButton
+                label={t("composer.sendVoiceNote")}
+                disabled={sendingVoice()}
+                onClick={() => void sendVoiceRecording()}
+              >
+                <ThemeIcon icon={Send} name="send" size={20} />
+              </IconButton>
+            </Show>
+          </div>
+        </Show>
+
         <IconButton
           type="submit"
-          label={draft().editingMessageId ? "Save edit" : "Send"}
+          label={draft().editingMessageId ? t("composer.saveEdit") : t("composer.send")}
           class="send-button"
           disabled={!connected() || state.sending || !draft().text.trim()}
         >
@@ -373,6 +472,28 @@ export function Composer(props: { model: AppModel; chatId: string }) {
           </div>
         </Show>
       </form>
+      <Show when={editor()}>
+        {(value) => (
+          <MediaEditor
+            source={value().source}
+            fileName={value().fileName}
+            onCancel={() => setEditor(null)}
+            onError={(message) => actions.notifyError(new BridgeError({ code: "invalid_argument", message, retryable: false }))}
+            onConfirm={(staged) => {
+              setEditor(null);
+              void actions.requestFileSend(
+                [staged.path],
+                "image",
+                AttachmentKind.Document,
+                false,
+                props.chatId,
+                [],
+                true,
+              );
+            }}
+          />
+        )}
+      </Show>
     </div>
   );
 
@@ -449,6 +570,169 @@ export function Composer(props: { model: AppModel; chatId: string }) {
     });
   }
 
+  async function startVoiceRecording() {
+    if (recording() || recordedBlobUrl()) return;
+    try {
+      audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch {
+      actions.notifyError(new BridgeError({
+        code: "microphone_unavailable",
+        message: t("composer.micDenied"),
+        retryable: false,
+      }));
+      return;
+    }
+    recordedChunks = [];
+    recordedBlob = undefined;
+    recordedVoiceNote = false;
+    discardRecording = false;
+    const preferred = ["audio/ogg;codecs=opus", "audio/webm;codecs=opus"];
+    const supported = preferred.find((type) => MediaRecorder.isTypeSupported(type)) ?? "audio/webm";
+    recordedMimeType = supported;
+    // Only an Ogg Opus recording can be sent as a push-to-talk voice note.
+    recordedVoiceNote = isPushToTalkContainer(supported);
+    mediaRecorder = new MediaRecorder(audioStream, { mimeType: supported });
+    mediaRecorder.ondataavailable = (event) => {
+      if (event.data.size > 0) recordedChunks.push(event.data);
+    };
+    mediaRecorder.onstop = () => {
+      const chunks = recordedChunks;
+      recordedChunks = [];
+      const dropped = discardRecording;
+      const shouldSend = sendOnStop;
+      discardRecording = false;
+      sendOnStop = false;
+      if (disposed || dropped) return;
+      const blob = new Blob(chunks, { type: recordedMimeType });
+      if (blob.size === 0) {
+        actions.notifyError(new BridgeError({
+          code: "empty_recording",
+          message: t("composer.emptyRecording"),
+          retryable: true,
+        }));
+        setRecording(false);
+        return;
+      }
+      if (shouldSend) {
+        void sendRecordedBlob(blob);
+      } else {
+        recordedBlob = blob;
+        setRecordedBlobUrl(URL.createObjectURL(blob));
+      }
+    };
+    mediaRecorder.start(250);
+    setRecording(true);
+    setRecordingSeconds(0);
+    recordingTimer = window.setInterval(() => {
+      setRecordingSeconds((seconds) => seconds + 1);
+    }, 1_000);
+    try {
+      audioContext = new AudioContext();
+      analyser = audioContext.createAnalyser();
+      analyser.fftSize = 128;
+      const source = audioContext.createMediaStreamSource(audioStream);
+      source.connect(analyser);
+      drawWaveform();
+    } catch {
+      analyser = undefined;
+    }
+  }
+
+  function drawWaveform() {
+    const canvas = root?.querySelector<HTMLCanvasElement>(".voice-waveform");
+    if (!canvas || !analyser) return;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    const width = canvas.width;
+    const height = canvas.height;
+    // The time-domain buffer must hold one full FFT window. A shorter
+    // buffer silently drops the older half of every window and the drawn
+    // line moves at half rate.
+    const buffer = new Uint8Array(analyser.fftSize);
+    analyser.getByteTimeDomainData(buffer);
+    context.clearRect(0, 0, width, height);
+    const stroke = getComputedStyle(canvas).getPropertyValue("--accent") || "#25d366";
+    context.strokeStyle = stroke;
+    context.lineWidth = 2;
+    context.beginPath();
+    for (let index = 0; index < buffer.length; index += 1) {
+      const value = (buffer[index]! - 128) / 128;
+      const x = (index / buffer.length) * width;
+      const y = height / 2 + value * (height / 2 - 2);
+      if (index === 0) context.moveTo(x, y);
+      else context.lineTo(x, y);
+    }
+    context.stroke();
+    analyserFrame = requestAnimationFrame(drawWaveform);
+  }
+
+  /** Stop the live capture. `discard` tells the asynchronous `onstop` callback
+   * whether to keep the final chunk (preview) or drop it (cancel). */
+  function stopVoiceRecording(discard = false) {
+    if (mediaRecorder && mediaRecorder.state !== "inactive") {
+      discardRecording = discard;
+      mediaRecorder.stop();
+    }
+    if (recordingTimer !== undefined) window.clearInterval(recordingTimer);
+    recordingTimer = undefined;
+    if (analyserFrame !== undefined) cancelAnimationFrame(analyserFrame);
+    analyserFrame = undefined;
+    analyser = undefined;
+    audioStream?.getTracks().forEach((track) => track.stop());
+    audioStream = undefined;
+    if (audioContext) {
+      void audioContext.close().catch(() => undefined);
+      audioContext = undefined;
+    }
+    setRecording(false);
+  }
+
+  function stopAndSendVoiceRecording() {
+    if (!recording() || sendingVoice()) return;
+    sendOnStop = true;
+    stopVoiceRecording(false);
+  }
+
+  function clearRecordedVoice() {
+    if (recordedBlobUrl()) URL.revokeObjectURL(recordedBlobUrl());
+    setRecordedBlobUrl("");
+    recordedBlob = undefined;
+    recordedVoiceNote = false;
+    recordedChunks = [];
+  }
+
+  function cancelVoiceRecording() {
+    stopVoiceRecording(true);
+    clearRecordedVoice();
+  }
+
+  async function sendRecordedBlob(blob: Blob) {
+    if (!blob || blob.size === 0 || sendingVoice()) return;
+    if (state.sending) {
+      actions.notifyError(new BridgeError({ code: "send_busy", message: t("composer.sendBusy"), retryable: false }));
+      return;
+    }
+    setSendingVoice(true);
+    try {
+      const rawBytes = new Uint8Array(await blob.arrayBuffer());
+      const oggBytes = recordedVoiceNote ? rawBytes : webmOpusToOggOpus(rawBytes);
+      const path = await stageVoiceNote(oggBytes, "audio/ogg;codecs=opus");
+      await actions.sendAttachment(path, AttachmentKind.Audio, true, props.chatId);
+      clearRecordedVoice();
+    } catch (error) {
+      actions.notifyError(normalizeBridgeError(error));
+    } finally {
+      setSendingVoice(false);
+    }
+  }
+
+  async function sendVoiceRecording() {
+    if (recordedBlob) {
+      await sendRecordedBlob(recordedBlob);
+    }
+  }
+
+
   function selectEmojiSuggestion(emoji: string) {
     const autocomplete = emojiAutocomplete();
     if (!autocomplete) return;
@@ -467,13 +751,14 @@ export function Composer(props: { model: AppModel; chatId: string }) {
     let stagedPath = "";
     try {
       stagedPath = await stageClipboardImage();
-      const accepted = actions.requestFileSend(
+      const accepted = await actions.requestFileSend(
         [stagedPath],
         "image",
         AttachmentKind.Document,
         false,
         props.chatId,
         [stagedPath],
+        true,
       );
       if (accepted) stagedPath = "";
       return;
@@ -543,7 +828,17 @@ export function Composer(props: { model: AppModel; chatId: string }) {
       title,
       filters,
     });
-    if (paths?.length) actions.requestFileSend(paths, mode, attachmentKind, false, props.chatId);
+    if (!paths?.length) return;
+    // A single photo opens the editor, where it can be cropped and rotated
+    // before it is sent. A batch goes straight to the send confirmation.
+    if (mode === "image" && paths.length === 1) {
+      setEditor({ source: paths[0], fileName: localFileName(paths[0]) });
+      return;
+    }
+    const accepted = await actions.requestFileSend(paths, mode, attachmentKind, false, props.chatId);
+    if (!accepted) {
+      actions.notifyError(new BridgeError({ code: "send_busy", message: t("composer.sendBusy"), retryable: false }));
+    }
   }
 }
 

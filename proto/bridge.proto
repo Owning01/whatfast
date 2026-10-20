@@ -59,6 +59,16 @@ message RpcRequest {
     ReconnectRequest reconnect = 38;
     GetIntegrityStatusRequest get_integrity_status = 39;
     RepairLocalCacheRequest repair_local_cache = 40;
+    DeleteMessageRequest delete_message = 41;
+    ListStatusesRequest list_statuses = 42;
+    SubscribeNewsletterRequest subscribe_newsletter = 43;
+    ListNewslettersRequest list_newsletters = 44;
+    ListNewsletterMessagesRequest list_newsletter_messages = 45;
+    UnsubscribeNewsletterRequest unsubscribe_newsletter = 46;
+    SetChatPinRequest set_chat_pin = 47;
+    SetChatArchiveRequest set_chat_archive = 48;
+    SetChatMuteRequest set_chat_mute = 49;
+    SetChatBlockRequest set_chat_block = 50;
   }
 }
 
@@ -106,6 +116,16 @@ message RpcResponse {
     ReconnectResponse reconnect = 47;
     GetIntegrityStatusResponse get_integrity_status = 48;
     RepairLocalCacheResponse repair_local_cache = 49;
+    DeleteMessageResponse delete_message = 50;
+    ListStatusesResponse list_statuses = 51;
+    SubscribeNewsletterResponse subscribe_newsletter = 52;
+    ListNewslettersResponse list_newsletters = 53;
+    ListNewsletterMessagesResponse list_newsletter_messages = 54;
+    UnsubscribeNewsletterResponse unsubscribe_newsletter = 55;
+    SetChatPinResponse set_chat_pin = 56;
+    SetChatArchiveResponse set_chat_archive = 57;
+    SetChatMuteResponse set_chat_mute = 58;
+    SetChatBlockResponse set_chat_block = 59;
   }
 }
 
@@ -315,6 +335,80 @@ message EditMessageRequest {
   string text = 3;
 }
 message EditMessageResponse { Message message = 1; }
+
+message DeleteMessageRequest {
+  string chat_id = 1;
+  string message_id = 2;
+  // True revokes for everyone via WhatsApp; false deletes only on this
+  // device and publishes a local revoked state.
+  bool delete_for_everyone = 3;
+}
+message DeleteMessageResponse { Message message = 1; }
+
+message ListStatusesRequest {}
+
+message StatusGroup {
+  // The sender's user JID (e.g. 5493811234567@s.whatsapp.net).
+  string sender_id = 1;
+  string sender_name = 2;
+  string sender_phone_number = 3;
+  // The last 24 hours of that sender's status messages, newest first.
+  repeated Message messages = 4;
+}
+
+message ListStatusesResponse {
+  // The chat id that maps to the status@broadcast transport; uploads and
+  // read receipts for statuses target this chat.
+  string chat_id = 1;
+  repeated StatusGroup groups = 2;
+}
+
+message Newsletter {
+  string jid = 1;
+  string name = 2;
+  int64 subscribed_at_ms = 3;
+  bool muted = 4;
+}
+
+message SubscribeNewsletterRequest { string invite_key = 1; }
+message SubscribeNewsletterResponse { Newsletter newsletter = 1; }
+
+message ListNewslettersRequest {}
+message ListNewslettersResponse { repeated Newsletter newsletters = 1; }
+
+message ListNewsletterMessagesRequest {
+  string jid = 1;
+  int32 limit = 2;
+}
+message ListNewsletterMessagesResponse { repeated Message messages = 1; }
+
+message UnsubscribeNewsletterRequest { string jid = 1; }
+message UnsubscribeNewsletterResponse {}
+
+message SetChatPinRequest {
+  string chat_id = 1;
+  bool pinned = 2;
+}
+message SetChatPinResponse { Chat chat = 1; }
+
+message SetChatArchiveRequest {
+  string chat_id = 1;
+  bool archived = 2;
+}
+message SetChatArchiveResponse { Chat chat = 1; }
+
+message SetChatMuteRequest {
+  string chat_id = 1;
+  // Unix milliseconds until which the chat stays muted. Zero unmutes the chat.
+  int64 mute_until_ms = 2;
+}
+message SetChatMuteResponse { Chat chat = 1; }
+
+message SetChatBlockRequest {
+  string chat_id = 1;
+  bool blocked = 2;
+}
+message SetChatBlockResponse { Chat chat = 1; }
 
 message SendImageRequest {
   // Stable UUID with the same idempotency contract as SendTextRequest.
@@ -540,6 +634,18 @@ message Chat {
   string contact_name = 12;
   string push_name = 13;
   string business_name = 14;
+  // True when the last message in the chat was sent by the linked device;
+  // lets the chat list prefix its preview with "You: ".
+  bool last_message_from_me = 15;
+  // The underlying WhatsApp transport JID (e.g. status@broadcast, a
+  // newsletter jid, or a @s.whatsapp.net user). Lets the client hide
+  // special-purpose conversations from the regular chat list.
+  string transport_jid = 16;
+  // Device-local block list. The linked-device transport does not expose
+  // WhatsApp app-state, so the block is owned by this desktop profile.
+  bool blocked = 17;
+  // Unix milliseconds until which the chat stays muted; zero means unmuted.
+  int64 mute_until_ms = 18;
 }
 
 message Message {

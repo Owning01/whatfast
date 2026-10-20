@@ -1,4 +1,5 @@
 /build/
+/release/*.exe
 /backend/whatfast-backend
 /desktop/target/
 /tauri/node_modules/

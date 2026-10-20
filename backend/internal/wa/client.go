@@ -1,6 +1,7 @@
 package wa
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/aes"
@@ -12,16 +13,18 @@ import (
 	"errors"
 	"fmt"
 	"image"
-	_ "image/gif"
+	"image/gif"
 	"image/jpeg"
 	"image/png"
 	"io"
 	"log/slog"
+	"math"
 	"mime"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -32,6 +35,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Owning01/whatfast/backend/internal/domain"
+	"github.com/Owning01/whatfast/backend/internal/linkpreview"
 	searchutil "github.com/Owning01/whatfast/backend/internal/search"
 	"github.com/Owning01/whatfast/backend/internal/securefs"
 	"github.com/Owning01/whatfast/backend/internal/sqliteprivacy"
@@ -121,6 +125,7 @@ type Client struct {
 	fetchAppStateFn     func(context.Context, appstate.WAPatchName, bool, bool) error
 	groupNameFetchMu    sync.Mutex
 	groupNameFetches    map[string]*groupNameFetch
+	linkPreviews        *linkpreview.Resolver
 	getGroupInfoFn      func(context.Context, *whatsmeow.Client, types.JID) (*types.GroupInfo, error)
 	sendPresenceFn      func(context.Context, *whatsmeow.Client, types.Presence) error
 	connectFn           func(context.Context, *whatsmeow.Client) error
@@ -232,9 +237,15 @@ var (
 	ErrInvalidAttachment       = errors.New("invalid attachment")
 	ErrForwardUnsupported      = errors.New("this message type cannot be forwarded")
 	ErrEditNotAllowed          = errors.New("this message can no longer be edited")
+	ErrDeleteNotAllowed        = errors.New("this message can no longer be deleted")
 	errAttachmentDownloadLimit = errors.New("attachment exceeds the 2 GiB download limit")
 	errImageDownloadLimit      = errors.New("image exceeds the 32 MiB download limit")
 )
+
+// RevokeWindow is the longest a sent message may be deleted for everyone.
+// whatsmeow does not enforce a client-side window, but the WhatsApp server
+// rejects revokes after roughly 48 hours.
+const RevokeWindow = 48 * time.Hour
 
 func (e *LogoutError) Error() string {
 	switch e.Stage {
@@ -282,7 +293,7 @@ func New(ctx context.Context, dataDir string, productStore *store.Store, sink Si
 		container.Close()
 		return nil, err
 	}
-	c := &Client{ctx: ctx, sessions: container, db: db, store: productStore, sink: sink, log: log, reducer: make(chan func(), 256), reducerDone: make(chan struct{}), inboundRetryWake: make(chan struct{}, 1), avatarDir: filepath.Join(dataDir, "avatars"), mediaDir: filepath.Join(dataDir, "media"), avatarFetches: make(map[string]*avatarFetch), negativeAvatars: make(map[string]time.Time), groupNameFetches: make(map[string]*groupNameFetch)}
+	c := &Client{ctx: ctx, sessions: container, db: db, store: productStore, sink: sink, log: log, reducer: make(chan func(), 256), reducerDone: make(chan struct{}), inboundRetryWake: make(chan struct{}, 1), avatarDir: filepath.Join(dataDir, "avatars"), mediaDir: filepath.Join(dataDir, "media"), avatarFetches: make(map[string]*avatarFetch), negativeAvatars: make(map[string]time.Time), groupNameFetches: make(map[string]*groupNameFetch), linkPreviews: linkpreview.New(linkpreview.Options{})}
 	if syncStatus, syncErr := productStore.SyncStatus(ctx); syncErr != nil {
 		c.log.Warn("load persisted sync status", "error", syncErr)
 	} else {
@@ -1778,6 +1789,7 @@ func (c *Client) SendText(ctx context.Context, clientID, chatID, text, replyToID
 	msg.Status = domain.StatusSent
 	err = c.store.ApplyMessage(ctx, msg, false)
 	c.emitChat(chatID)
+	c.attachLinkPreview(msg)
 	return msg, err
 }
 
@@ -1944,6 +1956,119 @@ func (c *Client) EditText(ctx context.Context, chatID, messageID, text string) (
 	}
 	c.emitChat(message.ChatJID)
 	return message, nil
+}
+
+// DeleteMessage revokes a sent message for everyone when forEveryone is true,
+// or hides it on this device only. Both paths persist the revoked state so
+// the change survives restarts and is broadcast to the desktop.
+func (c *Client) DeleteMessage(ctx context.Context, chatID, messageID string, forEveryone bool) (domain.Message, error) {
+	message, err := c.store.Message(ctx, chatID, messageID)
+	if err != nil {
+		return domain.Message{}, err
+	}
+	if message.Revoked {
+		return domain.Message{}, ErrDeleteNotAllowed
+	}
+	if forEveryone {
+		if !message.FromMe {
+			return domain.Message{}, ErrDeleteNotAllowed
+		}
+		if message.Timestamp.IsZero() || time.Since(message.Timestamp) > RevokeWindow {
+			return domain.Message{}, ErrDeleteNotAllowed
+		}
+		transport, err := c.store.PreferredJID(ctx, chatID)
+		if err != nil {
+			return domain.Message{}, err
+		}
+		jid, err := types.ParseJID(transport)
+		if err != nil {
+			return domain.Message{}, err
+		}
+		sendCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+		if _, err := c.wa.RevokeMessage(sendCtx, jid, types.MessageID(message.ID)); err != nil {
+			return domain.Message{}, err
+		}
+	}
+	message.Revoked = true
+	message.Kind = "revoked"
+	if err := c.store.ApplyMessage(ctx, message, false); err != nil {
+		return domain.Message{}, err
+	}
+	c.emitChat(message.ChatJID)
+	return message, nil
+}
+
+// SubscribeNewsletter subscribes to a channel from an invite key or a full
+// https://whatsapp.com/channel/<key> invite link and persists the subscription.
+func (c *Client) SubscribeNewsletter(ctx context.Context, inviteKey string) (domain.Newsletter, error) {
+	key := inviteKey
+	if strings.Contains(key, "whatsapp.com/channel/") {
+		key = key[strings.LastIndex(key, "/")+1:]
+	}
+	key = strings.TrimSpace(key)
+	if key == "" || len(key) > 128 {
+		return domain.Newsletter{}, fmt.Errorf("invalid channel invite key")
+	}
+	meta, err := c.wa.GetNewsletterInfoWithInvite(ctx, key)
+	if err != nil {
+		return domain.Newsletter{}, err
+	}
+	jid := meta.ID.String()
+	name := meta.ThreadMeta.Name.Text
+	if err := c.store.UpsertNewsletter(ctx, jid, name); err != nil {
+		return domain.Newsletter{}, err
+	}
+	liveCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if _, err := c.wa.NewsletterSubscribeLiveUpdates(liveCtx, meta.ID); err != nil {
+		c.log.Warn("subscribe channel live updates", "jid", jid, "error", err)
+	}
+	return domain.Newsletter{JID: jid, Name: name, SubscribedAt: time.Now()}, nil
+}
+
+func (c *Client) ListNewsletters(ctx context.Context) ([]domain.Newsletter, error) {
+	return c.store.Newsletters(ctx)
+}
+
+func (c *Client) UnsubscribeNewsletter(ctx context.Context, jid string) error {
+	return c.store.RemoveNewsletter(ctx, jid)
+}
+
+// NewsletterMessages fetches recent channel posts and maps them to wire
+// messages. Media bodies are exposed as downloadable references; the actual
+// download reuses the regular attachment transport.
+func (c *Client) NewsletterMessages(ctx context.Context, jid string, limit int) ([]domain.Message, error) {
+	parsed, err := types.ParseJID(jid)
+	if err != nil || parsed.Server != types.NewsletterServer {
+		return nil, fmt.Errorf("invalid channel jid")
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 25
+	}
+	posts, err := c.wa.GetNewsletterMessages(ctx, parsed, &whatsmeow.GetNewsletterMessagesParams{Count: limit})
+	if err != nil {
+		return nil, err
+	}
+	items := make([]domain.Message, 0, len(posts))
+	for _, post := range posts {
+		if post.Message == nil {
+			continue
+		}
+		content := extractMessageContent(post.Message, "newsletter")
+		items = append(items, domain.Message{
+			ID:          string(post.MessageID),
+			ChatJID:     jid,
+			TransportJID: jid,
+			SenderJID:   parsed.String(),
+			Text:        content.text,
+			Kind:        content.kind,
+			Image:       content.image,
+			Attachment:  content.attachment,
+			Timestamp:   post.Timestamp,
+		})
+	}
+	return items, nil
 }
 
 func forwardedContent(message domain.Message, contextInfo *waE2E.ContextInfo) (*waE2E.Message, error) {
@@ -2337,6 +2462,89 @@ func webpIsAnimated(data []byte) bool {
 	return false
 }
 
+// webpFirstFrame lifts the first animation frame out of an animated WebP file
+// and returns it as a standalone still image. The WebP decoders ignore the
+// ANIM and ANMF chunks, so an animated file cannot be decoded as a whole even
+// though every frame inside it is a complete VP8 or VP8L bitstream.
+func webpFirstFrame(data []byte) ([]byte, error) {
+	if len(data) < 12 || string(data[:4]) != "RIFF" || string(data[8:12]) != "WEBP" {
+		return nil, fmt.Errorf("not a WebP file")
+	}
+	for offset := 12; offset+8 <= len(data); {
+		kind := string(data[offset : offset+4])
+		size := int(binary.LittleEndian.Uint32(data[offset+4 : offset+8]))
+		payloadStart := offset + 8
+		if size < 0 || size > len(data)-payloadStart {
+			return nil, fmt.Errorf("WebP chunk %q is truncated", kind)
+		}
+		if kind == "ANMF" {
+			return webpFrameImage(data[payloadStart : payloadStart+size])
+		}
+		offset = payloadStart + size + size%2
+	}
+	return nil, fmt.Errorf("WebP file has no animation frame")
+}
+
+// webpFrameImage lifts the image bitstream out of an ANMF frame payload. The
+// payload starts with a 16 byte frame header and continues with the frame
+// image, optionally preceded by its own alpha chunk.
+func webpFrameImage(frame []byte) ([]byte, error) {
+	const frameHeaderSize = 16
+	if len(frame) <= frameHeaderSize {
+		return nil, fmt.Errorf("animation frame is truncated")
+	}
+	payload := frame[frameHeaderSize:]
+	for offset := 0; offset+8 <= len(payload); {
+		kind := string(payload[offset : offset+4])
+		size := int(binary.LittleEndian.Uint32(payload[offset+4 : offset+8]))
+		start := offset + 8
+		if size < 0 || size > len(payload)-start {
+			return nil, fmt.Errorf("animation frame chunk %q is truncated", kind)
+		}
+		if kind == "VP8 " || kind == "VP8L" {
+			return webpStillFile(kind, payload[start:start+size]), nil
+		}
+		offset = start + size + size%2
+	}
+	return nil, fmt.Errorf("animation frame has no image chunk")
+}
+
+// webpStillFile wraps a single VP8 or VP8L bitstream in a minimal WebP file so
+// the standard decoders can read it.
+func webpStillFile(kind string, payload []byte) []byte {
+	chunkSize := 8 + len(payload) + len(payload)%2
+	file := make([]byte, 0, 12+chunkSize)
+	file = append(file, "RIFF"...)
+	file = binary.LittleEndian.AppendUint32(file, uint32(4+chunkSize))
+	file = append(file, "WEBP"...)
+	file = append(file, kind...)
+	file = binary.LittleEndian.AppendUint32(file, uint32(len(payload)))
+	file = append(file, payload...)
+	if len(payload)%2 == 1 {
+		file = append(file, 0)
+	}
+	return file
+}
+
+// decodeStillImage decodes an image into a single frame. Animated WebP files
+// cannot be decoded as a whole, so their first frame is decoded instead: it
+// is a complete still image and keeps the preview pipeline working for them.
+func decodeStillImage(data []byte) (image.Image, error) {
+	decoded, _, err := image.Decode(bytes.NewReader(data))
+	if err == nil {
+		return decoded, nil
+	}
+	frame, frameErr := webpFirstFrame(data)
+	if frameErr != nil {
+		return nil, err
+	}
+	decoded, _, err = image.Decode(bytes.NewReader(frame))
+	if err != nil {
+		return nil, fmt.Errorf("decode WebP animation frame: %w", err)
+	}
+	return decoded, nil
+}
+
 type attachmentSource struct {
 	file     *os.File
 	path     string
@@ -2403,6 +2611,9 @@ func openAttachmentSource(sourcePath, kind string, voiceNote bool) (source attac
 			return source, fmt.Errorf("audio attachment has content type %s", mimeType)
 		}
 		if voiceNote {
+			// WhatsApp only accepts Ogg Opus for a voice note, so a file
+			// that is not one is rejected instead of being sent as a plain
+			// audio attachment the caller did not ask for.
 			if !bytes.HasPrefix(header, []byte("OggS")) || !bytes.Contains(header, []byte("OpusHead")) {
 				return source, fmt.Errorf("voice notes must contain Ogg Opus audio")
 			}
@@ -2442,6 +2653,749 @@ func detectAttachmentMIME(header []byte, sourcePath, kind string) string {
 		return "application/octet-stream"
 	}
 	return detected
+}
+
+// outgoingImageAnimated reports whether an outgoing image is an animation. A
+// GIF with more than one image descriptor animates, and an animated WebP
+// carries its frames in the animation chunks.
+func outgoingImageAnimated(mimeType string, data []byte) bool {
+	switch mimeType {
+	case "image/gif":
+		frames, err := gifFrameCount(bytes.NewReader(data))
+		return err == nil && frames > 1
+	case "image/webp":
+		return webpIsAnimated(data)
+	default:
+		return false
+	}
+}
+
+// outgoingMediaMetadata describes what an outgoing media file says about
+// itself. Every value comes from parsing the file: none of them is guessed.
+type outgoingMediaMetadata struct {
+	durationSeconds uint32
+	width           uint32
+	height          uint32
+	animated        bool
+}
+
+// probeOutgoingMedia reads the metadata of an outgoing attachment straight
+// from the file. A format that cannot be parsed reports no metadata at all
+// instead of an invented one.
+func probeOutgoingMedia(path string) outgoingMediaMetadata {
+	metadata := outgoingMediaMetadata{}
+	header, err := readFileHeader(path, 64*1024)
+	if err != nil {
+		return metadata
+	}
+	switch {
+	case len(header) >= 6 && (string(header[:6]) == "GIF89a" || string(header[:6]) == "GIF87a"):
+		width, height, animated, ok := probeGIF(path)
+		if ok {
+			metadata.width, metadata.height, metadata.animated = width, height, animated
+		}
+	case len(header) >= 12 && string(header[:4]) == "RIFF" && string(header[8:12]) == "WEBP":
+		metadata.animated = webpIsAnimated(header)
+	case len(header) >= 12 && string(header[4:8]) == "ftyp":
+		duration, width, height, ok := probeISOBMPF(path)
+		if ok {
+			metadata.durationSeconds, metadata.width, metadata.height = duration, width, height
+		}
+	case len(header) >= 4 && bytes.Equal(header[:4], []byte{0x1a, 0x45, 0xdf, 0xa3}):
+		duration, width, height, ok := probeMatroska(path)
+		if ok {
+			metadata.durationSeconds, metadata.width, metadata.height = duration, width, height
+		}
+	case bytes.HasPrefix(header, []byte("OggS")):
+		duration, ok := probeOgg(path)
+		if ok {
+			metadata.durationSeconds = duration
+		}
+	case len(header) >= 12 && string(header[:4]) == "RIFF" && string(header[8:12]) == "WAVE":
+		duration, ok := probeWAV(header)
+		if ok {
+			metadata.durationSeconds = duration
+		}
+	}
+	return metadata
+}
+
+// readFileHeader reads the first bytes of a file.
+func readFileHeader(path string, size int) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	header := make([]byte, size)
+	read, err := file.Read(header)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	return header[:read], nil
+}
+
+// probeGIF reports the dimensions of a GIF and whether it animates. The
+// std decoder would materialise every frame of an animation, so the frame
+// count comes from a block scan and the dimensions from the decoder header.
+func probeGIF(path string) (width, height uint32, animated bool, ok bool) {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, 0, false, false
+	}
+	defer file.Close()
+	config, err := gif.DecodeConfig(file)
+	if err != nil {
+		return 0, 0, false, false
+	}
+	if _, err = file.Seek(0, io.SeekStart); err != nil {
+		return 0, 0, false, false
+	}
+	frames, err := gifFrameCount(file)
+	if err != nil {
+		return uint32(config.Width), uint32(config.Height), false, true
+	}
+	return uint32(config.Width), uint32(config.Height), frames > 1, true
+}
+
+// gifFrameCount counts the image descriptors of a GIF without decoding a
+// single frame.
+func gifFrameCount(reader io.Reader) (int, error) {
+	buffered := bufio.NewReader(reader)
+	header := make([]byte, 13)
+	if _, err := io.ReadFull(buffered, header); err != nil {
+		return 0, err
+	}
+	if string(header[:6]) != "GIF89a" && string(header[:6]) != "GIF87a" {
+		return 0, fmt.Errorf("not a GIF file")
+	}
+	flags := header[10]
+	if flags&0x80 != 0 {
+		if _, err := buffered.Discard(3 * (1 << ((flags & 0x07) + 1))); err != nil {
+			return 0, err
+		}
+	}
+	count := 0
+	for {
+		marker, err := buffered.ReadByte()
+		if err != nil {
+			return count, err
+		}
+		switch marker {
+		case 0x3b: // trailer
+			return count, nil
+		case 0x21: // extension
+			if _, err = buffered.Discard(1); err != nil {
+				return count, err
+			}
+			if err = skipGIFSubBlocks(buffered); err != nil {
+				return count, err
+			}
+		case 0x2c: // image descriptor
+			count++
+			descriptor := make([]byte, 9)
+			if _, err = io.ReadFull(buffered, descriptor); err != nil {
+				return count, err
+			}
+			flags = descriptor[8]
+			if flags&0x80 != 0 {
+				if _, err = buffered.Discard(3 * (1 << ((flags & 0x07) + 1))); err != nil {
+					return count, err
+				}
+			}
+			if _, err = buffered.Discard(1); err != nil {
+				return count, err
+			}
+			if err = skipGIFSubBlocks(buffered); err != nil {
+				return count, err
+			}
+		default:
+			return count, nil
+		}
+	}
+}
+
+// skipGIFSubBlocks skips the data sub-blocks of a GIF block.
+func skipGIFSubBlocks(reader *bufio.Reader) error {
+	for {
+		size, err := reader.ReadByte()
+		if err != nil {
+			return err
+		}
+		if size == 0 {
+			return nil
+		}
+		if _, err = reader.Discard(int(size)); err != nil {
+			return err
+		}
+	}
+}
+
+// isoBox is one ISO base media file format box.
+type isoBox struct {
+	kind        string
+	payloadFrom int64
+	payloadTo   int64
+}
+
+// readISOBoxes lists the boxes inside the [start, end) range of a file.
+func readISOBoxes(file *os.File, start, end int64) ([]isoBox, error) {
+	boxes := make([]isoBox, 0, 8)
+	offset := start
+	for offset+8 <= end {
+		header := make([]byte, 8)
+		if _, err := file.ReadAt(header, offset); err != nil {
+			return nil, err
+		}
+		size := int64(binary.BigEndian.Uint32(header[:4]))
+		kind := string(header[4:8])
+		payloadFrom := offset + 8
+		switch size {
+		case 0:
+			size = end - offset
+		case 1:
+			extended := make([]byte, 8)
+			if _, err := file.ReadAt(extended, payloadFrom); err != nil {
+				return nil, err
+			}
+			size = int64(binary.BigEndian.Uint64(extended))
+			payloadFrom += 8
+		}
+		if size < 8 {
+			return nil, fmt.Errorf("invalid %q box size", kind)
+		}
+		payloadTo := offset + size
+		if payloadTo > end {
+			payloadTo = end
+		}
+		boxes = append(boxes, isoBox{kind: kind, payloadFrom: payloadFrom, payloadTo: payloadTo})
+		offset = payloadTo
+	}
+	return boxes, nil
+}
+
+// probeISOBMPF reads the duration and the display size of an ISO base media
+// file format container.
+func probeISOBMPF(path string) (duration uint32, width, height uint32, ok bool) {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, 0, 0, false
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return 0, 0, 0, false
+	}
+	boxes, err := readISOBoxes(file, 0, info.Size())
+	if err != nil {
+		return 0, 0, 0, false
+	}
+	for _, box := range boxes {
+		if box.kind != "moov" {
+			continue
+		}
+		meta, err := readISOMovie(file, box)
+		if err != nil {
+			continue
+		}
+		if meta.duration > 0 {
+			duration = meta.duration
+		}
+		if meta.width > 0 {
+			width = meta.width
+		}
+		if meta.height > 0 {
+			height = meta.height
+		}
+		ok = true
+	}
+	return duration, width, height, ok
+}
+
+// isoMeta holds the metadata of an ISO base media file format movie box.
+type isoMeta struct {
+	duration uint32
+	width    uint32
+	height   uint32
+}
+
+// readISOMovie reads the movie header of a moov box.
+func readISOMovie(file *os.File, box isoBox) (isoMeta, error) {
+	var meta isoMeta
+	boxes, err := readISOBoxes(file, box.payloadFrom, box.payloadTo)
+	if err != nil {
+		return meta, err
+	}
+	for _, child := range boxes {
+		switch child.kind {
+		case "mvhd":
+			payload, err := readISOPayload(file, child)
+			if err != nil {
+				continue
+			}
+			timescale, value, valid := readISOTimescaleDuration(payload)
+			if valid {
+				meta.duration = secondsFromTimescale(value, timescale)
+			}
+		case "trak":
+			track, err := readISOTrack(file, child)
+			if err != nil {
+				continue
+			}
+			if track.width > 0 {
+				meta.width = track.width
+			}
+			if track.height > 0 {
+				meta.height = track.height
+			}
+			if meta.duration == 0 && track.duration > 0 {
+				meta.duration = track.duration
+			}
+		}
+	}
+	return meta, nil
+}
+
+// readISOTrack reads the display size of a track box.
+func readISOTrack(file *os.File, box isoBox) (isoMeta, error) {
+	var meta isoMeta
+	boxes, err := readISOBoxes(file, box.payloadFrom, box.payloadTo)
+	if err != nil {
+		return meta, err
+	}
+	for _, child := range boxes {
+		switch child.kind {
+		case "tkhd":
+			payload, err := readISOPayload(file, child)
+			if err != nil {
+				continue
+			}
+			if len(payload) < 84 {
+				continue
+			}
+			meta.width = binary.BigEndian.Uint32(payload[len(payload)-8:len(payload)-4]) >> 16
+			meta.height = binary.BigEndian.Uint32(payload[len(payload)-4:]) >> 16
+		case "mdia":
+			media, err := readISOMedia(file, child)
+			if err != nil {
+				continue
+			}
+			if media.duration > 0 {
+				meta.duration = media.duration
+			}
+		}
+	}
+	return meta, nil
+}
+
+// readISOMedia reads the media header of a mdia box.
+func readISOMedia(file *os.File, box isoBox) (isoMeta, error) {
+	var meta isoMeta
+	boxes, err := readISOBoxes(file, box.payloadFrom, box.payloadTo)
+	if err != nil {
+		return meta, err
+	}
+	for _, child := range boxes {
+		if child.kind != "mdhd" {
+			continue
+		}
+		payload, err := readISOPayload(file, child)
+		if err != nil {
+			continue
+		}
+		timescale, value, valid := readISOTimescaleDuration(payload)
+		if valid {
+			meta.duration = secondsFromTimescale(value, timescale)
+		}
+	}
+	return meta, nil
+}
+
+// readISOPayload reads the payload of a box.
+func readISOPayload(file *os.File, box isoBox) ([]byte, error) {
+	size := box.payloadTo - box.payloadFrom
+	if size <= 0 || size > 1024 {
+		return nil, fmt.Errorf("unexpected %q box size", box.kind)
+	}
+	payload := make([]byte, size)
+	if _, err := file.ReadAt(payload, box.payloadFrom); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+// readISOTimescaleDuration reads the timescale and the duration of an mvhd or
+// mdhd box payload.
+func readISOTimescaleDuration(payload []byte) (timescale, duration uint32, ok bool) {
+	if len(payload) < 4 {
+		return 0, 0, false
+	}
+	switch payload[0] {
+	case 0:
+		if len(payload) < 20 {
+			return 0, 0, false
+		}
+		timescale = binary.BigEndian.Uint32(payload[12:16])
+		duration = binary.BigEndian.Uint32(payload[16:20])
+	case 1:
+		if len(payload) < 32 {
+			return 0, 0, false
+		}
+		timescale = binary.BigEndian.Uint32(payload[20:24])
+		duration = binary.BigEndian.Uint32(payload[24:28])
+	default:
+		return 0, 0, false
+	}
+	return timescale, duration, timescale > 0
+}
+
+// secondsFromTimescale converts a media duration into whole seconds.
+func secondsFromTimescale(duration, timescale uint32) uint32 {
+	if timescale == 0 {
+		return 0
+	}
+	return uint32((uint64(duration) + uint64(timescale)/2) / uint64(timescale))
+}
+
+// EBML element identifiers used by the Matroska probe.
+const (
+	ebmlSegment      = 0x18538067
+	ebmlInfo         = 0x1549a966
+	ebmlTimecodeScale = 0x2ad7b1
+	ebmlDuration     = 0x4489
+	ebmlTracks       = 0x1654ae6b
+	ebmlTrackEntry   = 0xae
+	ebmlVideo        = 0xe0
+	ebmlPixelWidth   = 0xb0
+	ebmlPixelHeight  = 0xba
+)
+
+// ebmlElement is one EBML element.
+type ebmlElement struct {
+	id          uint64
+	payloadFrom int64
+	payloadTo   int64
+}
+
+// readEBMLElements lists the EBML elements inside the [start, end) range.
+func readEBMLElements(file *os.File, start, end int64) ([]ebmlElement, error) {
+	elements := make([]ebmlElement, 0, 8)
+	offset := start
+	for offset < end {
+		id, idLength, err := readEBMLID(file, offset)
+		if err != nil {
+			return elements, err
+		}
+		size, sizeLength, unknown, err := readEBMLSize(file, offset+int64(idLength))
+		if err != nil {
+			return elements, err
+		}
+		payloadFrom := offset + int64(idLength) + int64(sizeLength)
+		payloadTo := payloadFrom + size
+		if unknown || payloadTo > end || payloadTo <= payloadFrom {
+			payloadTo = end
+		}
+		elements = append(elements, ebmlElement{id: id, payloadFrom: payloadFrom, payloadTo: payloadTo})
+		offset = payloadTo
+	}
+	return elements, nil
+}
+
+// readEBMLID reads an EBML element identifier.
+func readEBMLID(file *os.File, offset int64) (uint64, int, error) {
+	first := make([]byte, 1)
+	if _, err := file.ReadAt(first, offset); err != nil {
+		return 0, 0, err
+	}
+	mask := byte(0x80)
+	length := 1
+	for mask > 0 && first[0]&mask == 0 {
+		mask >>= 1
+		length++
+	}
+	if length > 4 {
+		return 0, 0, fmt.Errorf("invalid EBML identifier")
+	}
+	raw := make([]byte, length)
+	if _, err := file.ReadAt(raw, offset); err != nil {
+		return 0, 0, err
+	}
+	value := uint64(0)
+	for _, b := range raw {
+		value = value<<8 | uint64(b)
+	}
+	return value, length, nil
+}
+
+// readEBMLSize reads an EBML element size.
+func readEBMLSize(file *os.File, offset int64) (int64, int, bool, error) {
+	first := make([]byte, 1)
+	if _, err := file.ReadAt(first, offset); err != nil {
+		return 0, 0, false, err
+	}
+	mask := byte(0x80)
+	length := 1
+	for mask > 0 && first[0]&mask == 0 {
+		mask >>= 1
+		length++
+	}
+	if length > 8 {
+		return 0, 0, false, fmt.Errorf("invalid EBML size")
+	}
+	raw := make([]byte, length)
+	if _, err := file.ReadAt(raw, offset); err != nil {
+		return 0, 0, false, err
+	}
+	raw[0] &^= mask
+	value := int64(0)
+	for _, b := range raw {
+		value = value<<8 | int64(b)
+	}
+	unknown := value == int64(1)<<(7*length)-1
+	return value, length, unknown, nil
+}
+
+// probeMatroska reads the duration and the display size of a Matroska or
+// WebM container.
+func probeMatroska(path string) (duration uint32, width, height uint32, ok bool) {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, 0, 0, false
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return 0, 0, 0, false
+	}
+	elements, err := readEBMLElements(file, 0, info.Size())
+	if err != nil && len(elements) == 0 {
+		return 0, 0, 0, false
+	}
+	for _, element := range elements {
+		if element.id != ebmlSegment {
+			continue
+		}
+		children, err := readEBMLElements(file, element.payloadFrom, element.payloadTo)
+		if err != nil && len(children) == 0 {
+			continue
+		}
+		for _, child := range children {
+			switch child.id {
+			case ebmlInfo:
+				seconds, found := readMatroskaInfo(file, child)
+				if found {
+					duration, ok = seconds, true
+				}
+			case ebmlTracks:
+				trackWidth, trackHeight, found := readMatroskaVideo(file, child)
+				if found {
+					width, height, ok = trackWidth, trackHeight, true
+				}
+			}
+		}
+	}
+	return duration, width, height, ok
+}
+
+// readMatroskaInfo reads the duration of a Matroska Info element.
+func readMatroskaInfo(file *os.File, box ebmlElement) (uint32, bool) {
+	children, err := readEBMLElements(file, box.payloadFrom, box.payloadTo)
+	if err != nil && len(children) == 0 {
+		return 0, false
+	}
+	timecodeScale := uint64(1000000)
+	var duration float64
+	found := false
+	for _, child := range children {
+		switch child.id {
+		case ebmlTimecodeScale:
+			payload, err := readEBMLPayload(file, child)
+			if err != nil || len(payload) == 0 {
+				continue
+			}
+			value := uint64(0)
+			for _, b := range payload {
+				value = value<<8 | uint64(b)
+			}
+			if value > 0 {
+				timecodeScale = value
+			}
+		case ebmlDuration:
+			payload, err := readEBMLPayload(file, child)
+			if err != nil {
+				continue
+			}
+			switch len(payload) {
+			case 4:
+				duration = float64(math.Float32frombits(binary.BigEndian.Uint32(payload)))
+			case 8:
+				duration = math.Float64frombits(binary.BigEndian.Uint64(payload))
+			default:
+				continue
+			}
+			found = true
+		}
+	}
+	if !found {
+		return 0, false
+	}
+	seconds := duration * float64(timecodeScale) / 1e9
+	if seconds <= 0 {
+		return 0, false
+	}
+	return uint32(math.Round(seconds)), true
+}
+
+// readMatroskaVideo reads the pixel size of a Matroska Tracks element.
+func readMatroskaVideo(file *os.File, box ebmlElement) (uint32, uint32, bool) {
+	entries, err := readEBMLElements(file, box.payloadFrom, box.payloadTo)
+	if err != nil && len(entries) == 0 {
+		return 0, 0, false
+	}
+	for _, entry := range entries {
+		if entry.id != ebmlTrackEntry {
+			continue
+		}
+		children, err := readEBMLElements(file, entry.payloadFrom, entry.payloadTo)
+		if err != nil && len(children) == 0 {
+			continue
+		}
+		for _, child := range children {
+			if child.id != ebmlVideo {
+				continue
+			}
+			video, err := readEBMLElements(file, child.payloadFrom, child.payloadTo)
+			if err != nil && len(video) == 0 {
+				continue
+			}
+			var width, height uint32
+			for _, property := range video {
+				payload, err := readEBMLPayload(file, property)
+				if err != nil || len(payload) == 0 {
+					continue
+				}
+				value := uint32(0)
+				for _, b := range payload {
+					value = value<<8 | uint32(b)
+				}
+				switch property.id {
+				case ebmlPixelWidth:
+					width = value
+				case ebmlPixelHeight:
+					height = value
+				}
+			}
+			if width > 0 && height > 0 {
+				return width, height, true
+			}
+		}
+	}
+	return 0, 0, false
+}
+
+// readEBMLPayload reads the payload of an EBML element.
+func readEBMLPayload(file *os.File, element ebmlElement) ([]byte, error) {
+	size := element.payloadTo - element.payloadFrom
+	if size <= 0 || size > 1024 {
+		return nil, fmt.Errorf("unexpected EBML payload size")
+	}
+	payload := make([]byte, size)
+	if _, err := file.ReadAt(payload, element.payloadFrom); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+// probeOgg reads the duration of an Ogg stream. The granule position of the
+// last page counts samples, so the duration needs the sample rate of the
+// codec the stream carries.
+func probeOgg(path string) (uint32, bool) {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, false
+	}
+	defer file.Close()
+	reader := bufio.NewReader(file)
+	sampleRate := 0
+	var lastGranule int64 = -1
+	for {
+		header := make([]byte, 27)
+		if _, err = io.ReadFull(reader, header); err != nil {
+			break
+		}
+		if string(header[:4]) != "OggS" {
+			break
+		}
+		granule := int64(binary.LittleEndian.Uint64(header[6:14]))
+		segments := int(header[26])
+		table := make([]byte, segments)
+		if _, err = io.ReadFull(reader, table); err != nil {
+			break
+		}
+		payloadSize := 0
+		for _, size := range table {
+			payloadSize += int(size)
+		}
+		if sampleRate == 0 {
+			payload := make([]byte, payloadSize)
+			if _, err = io.ReadFull(reader, payload); err != nil {
+				break
+			}
+			sampleRate = oggSampleRate(payload)
+		} else if _, err = reader.Discard(payloadSize); err != nil {
+			break
+		}
+		if granule >= 0 {
+			lastGranule = granule
+		}
+	}
+	if sampleRate <= 0 || lastGranule <= 0 {
+		return 0, false
+	}
+	return uint32((uint64(lastGranule) + uint64(sampleRate)/2) / uint64(sampleRate)), true
+}
+
+// oggSampleRate reads the sample rate of the codec identification header of
+// an Ogg stream.
+func oggSampleRate(payload []byte) int {
+	if index := bytes.Index(payload, []byte("OpusHead")); index >= 0 {
+		// Opus granule positions always count 48 kHz samples.
+		return 48000
+	}
+	if index := bytes.Index(payload, []byte("vorbis")); index >= 1 && len(payload) >= index+15 {
+		return int(binary.LittleEndian.Uint32(payload[index+11 : index+15]))
+	}
+	return 0
+}
+
+// probeWAV reads the duration of a RIFF WAVE file.
+func probeWAV(header []byte) (uint32, bool) {
+	if len(header) < 12 {
+		return 0, false
+	}
+	var byteRate, dataSize uint32
+	offset := 12
+	for offset+8 <= len(header) {
+		kind := string(header[offset : offset+4])
+		size := binary.LittleEndian.Uint32(header[offset+4 : offset+8])
+		payload := offset + 8
+		switch kind {
+		case "fmt ":
+			if payload+12 <= len(header) {
+				byteRate = binary.LittleEndian.Uint32(header[payload+8 : payload+12])
+			}
+		case "data":
+			dataSize = size
+		}
+		if size > uint32(len(header)-payload) {
+			break
+		}
+		offset = payload + int(size) + int(size)%2
+	}
+	if byteRate == 0 {
+		return 0, false
+	}
+	return dataSize / byteRate, true
 }
 
 func validCacheExtension(extension string) bool {
@@ -2698,41 +3652,36 @@ func (c *Client) writeThumbnail(originalPath, thumbnailPath string) error {
 	if width == 0 || height == 0 {
 		return fmt.Errorf("thumbnail source has invalid dimensions")
 	}
+	data, err := readImageFile(originalPath)
+	if err != nil {
+		return err
+	}
+	animated := webpIsAnimated(data)
 	temporary, err := os.CreateTemp(c.mediaDir, ".thumbnail-*.tmp")
 	if err != nil {
 		return err
 	}
 	temporaryPath := temporary.Name()
 	defer os.Remove(temporaryPath)
-	if err = temporary.Chmod(0o600); err == nil && width == config.Width && height == config.Height {
-		// Already-bounded animated GIF/WebP assets must retain their animation;
+	if err = temporary.Chmod(0o600); err == nil && width == config.Width && height == config.Height && !animated {
+		// Already-bounded animated GIF assets must retain their animation;
 		// copying also avoids a needless decode when no resize is required.
-		var source *os.File
-		source, err = os.Open(originalPath)
-		if err == nil {
-			_, err = io.Copy(temporary, source)
-		}
-		if source != nil {
-			if sourceErr := source.Close(); err == nil {
-				err = sourceErr
-			}
-		}
+		// Animated WebP assets are the exception: their frames are lifted
+		// into a PNG preview because the raw WebP bytes are not a valid
+		// image for every renderer that reads the thumbnail.
+		_, err = temporary.Write(data)
 	} else if err == nil {
-		var source *os.File
-		source, err = os.Open(originalPath)
+		var decoded image.Image
+		decoded, err = decodeStillImage(data)
 		if err == nil {
-			var decoded image.Image
-			decoded, _, err = image.Decode(source)
-			if err == nil {
-				thumbnail := image.NewRGBA(image.Rect(0, 0, width, height))
-				xdraw.CatmullRom.Scale(thumbnail, thumbnail.Bounds(), decoded, decoded.Bounds(), xdraw.Over, nil)
-				err = png.Encode(temporary, thumbnail)
-			}
-		}
-		if source != nil {
-			if sourceErr := source.Close(); err == nil {
-				err = sourceErr
-			}
+			thumbnail := image.NewRGBA(image.Rect(0, 0, width, height))
+			xdraw.CatmullRom.Scale(thumbnail, thumbnail.Bounds(), decoded, decoded.Bounds(), xdraw.Over, nil)
+			err = png.Encode(temporary, thumbnail)
+		} else if animated {
+			// An animated WebP that cannot be decoded even frame by frame
+			// still deserves a thumbnail: keep the original bytes so the
+			// animation survives instead of failing the whole download.
+			_, err = temporary.Write(data)
 		}
 	}
 	if closeErr := temporary.Close(); err == nil {
@@ -2747,17 +3696,35 @@ func (c *Client) writeThumbnail(originalPath, thumbnailPath string) error {
 	return nil
 }
 
-func embeddedJPEGThumbnail(path string) ([]byte, error) {
+// readImageFile reads a cached image file within the image size limit.
+func readImageFile(path string) ([]byte, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	thumbnail, _, err := image.Decode(file)
-	if closeErr := file.Close(); err == nil {
-		err = closeErr
-	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxImageBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("decode embedded thumbnail: %w", err)
+		return nil, err
+	}
+	if len(data) == 0 || len(data) > maxImageBytes {
+		return nil, fmt.Errorf("cached image has invalid size")
+	}
+	return data, nil
+}
+
+// embeddedJPEGThumbnail returns the JPEG preview embedded in a WhatsApp media
+// message. A format that cannot be decoded yields no preview instead of an
+// error: the preview is an optimisation, and refusing to send a message
+// because its preview is missing would lose the attachment itself.
+func embeddedJPEGThumbnail(path string) ([]byte, error) {
+	data, err := readImageFile(path)
+	if err != nil {
+		return nil, err
+	}
+	thumbnail, err := decodeStillImage(data)
+	if err != nil {
+		return nil, nil
 	}
 	var encoded bytes.Buffer
 	if err = jpeg.Encode(&encoded, thumbnail, &jpeg.Options{Quality: 72}); err != nil {
@@ -2899,6 +3866,7 @@ func (c *Client) SendImage(ctx context.Context, clientID, chatID, sourcePath, ca
 		return domain.Message{}, err
 	}
 	width, height := uint32(config.Width), uint32(config.Height)
+	animated := outgoingImageAnimated(mimeType, data)
 	waID := string(c.wa.GenerateMessageID())
 	localPath, thumbnailPath, err := c.cacheImageBytes(chatID, waID, mimeType, data)
 	if err != nil {
@@ -2911,7 +3879,7 @@ func (c *Client) SendImage(ctx context.Context, clientID, chatID, sourcePath, ca
 		return domain.Message{}, err
 	}
 	pending := domain.Message{ID: waID, ChatJID: chatID, TransportJID: chat.String(), SenderJID: c.OwnID(), Text: caption, Timestamp: time.Now(), FromMe: true, Status: domain.StatusPending, Kind: "image", ReplyToID: replyToID, ReplyToChatID: replyToChatID,
-		Image: &domain.Image{Caption: caption, MIMEType: mimeType, LocalPath: localPath, JPEGThumbnail: jpegThumbnail, Width: width, Height: height, FileSize: uint64(len(data))}}
+		Image: &domain.Image{Caption: caption, MIMEType: mimeType, LocalPath: localPath, JPEGThumbnail: jpegThumbnail, Width: width, Height: height, FileSize: uint64(len(data)), Animated: animated}}
 	if pending.Text == "" {
 		pending.Text = "📷 Photo"
 	}
@@ -3263,12 +4231,17 @@ func outgoingAttachmentMessage(kind string, attachment *domain.Attachment, uploa
 			URL: &upload.URL, DirectPath: &upload.DirectPath, MediaKey: upload.MediaKey, FileEncSHA256: upload.FileEncSHA256,
 			FileSHA256: upload.FileSHA256, FileLength: &upload.FileLength, Mimetype: proto.String(attachment.MIMEType),
 			Caption: proto.String(attachment.Caption), ContextInfo: contextInfo,
+			// The duration, the display size and the GIF flag come from the
+			// file itself. Without them the receiving client cannot tell a
+			// GIF from a still video nor show the length of the clip.
+			Seconds: proto.Uint32(attachment.DurationSeconds), Width: proto.Uint32(attachment.Width), Height: proto.Uint32(attachment.Height),
+			GifPlayback: proto.Bool(attachment.Animated),
 		}}, nil
 	case "audio":
 		return &waE2E.Message{AudioMessage: &waE2E.AudioMessage{
 			URL: &upload.URL, DirectPath: &upload.DirectPath, MediaKey: upload.MediaKey, FileEncSHA256: upload.FileEncSHA256,
 			FileSHA256: upload.FileSHA256, FileLength: &upload.FileLength, Mimetype: proto.String(attachment.MIMEType),
-			PTT: proto.Bool(attachment.VoiceNote), ContextInfo: contextInfo,
+			PTT: proto.Bool(attachment.VoiceNote), ContextInfo: contextInfo, Seconds: proto.Uint32(attachment.DurationSeconds),
 		}}, nil
 	default:
 		return nil, fmt.Errorf("unsupported attachment kind %q", kind)
@@ -3322,11 +4295,16 @@ func (c *Client) SendAttachment(ctx context.Context, clientID, chatID, sourcePat
 	}
 	waID := string(c.wa.GenerateMessageID())
 	attachment := &domain.Attachment{
-		Caption: caption, MIMEType: source.mimeType, FileSize: uint64(source.size), VoiceNote: voiceNote,
+		Caption: caption, MIMEType: source.mimeType, FileName: source.fileName, FileSize: uint64(source.size), VoiceNote: voiceNote,
 	}
-	if kind == "document" {
-		attachment.FileName = source.fileName
-	}
+	// The duration, the display size and the animation flag are read from the
+	// file itself so the receiving client and the desktop show the same
+	// metadata the local file carries.
+	media := probeOutgoingMedia(source.path)
+	attachment.DurationSeconds = media.durationSeconds
+	attachment.Width = media.width
+	attachment.Height = media.height
+	attachment.Animated = media.animated
 	pending := domain.Message{
 		ID: waID, ChatJID: chatID, TransportJID: chat.String(), SenderJID: c.OwnID(),
 		Text: attachmentFallback(kind, caption, source.fileName, voiceNote), Timestamp: time.Now(), FromMe: true,
@@ -4830,6 +5808,7 @@ func (c *Client) reduceMessage(evt *events.Message, unread bool) {
 	m := domainMessage(evt, chatID, transportJID)
 	c.resolveMessageReplyChat(&m)
 	messagePersisted := c.persistInboundMessage(m, unread)
+	c.attachLinkPreview(m)
 	if pin := evt.SourceWebMsg.GetPinInChat(); pin != nil && pin.GetKey().GetID() != "" {
 		atMS := pin.GetSenderTimestampMS()
 		if atMS <= 0 {
@@ -5612,6 +6591,92 @@ func joinNonEmpty(separator string, values ...string) string {
 		}
 	}
 	return strings.Join(parts, separator)
+}
+
+// linkPattern matches the http(s) links a message body can carry.
+var linkPattern = regexp.MustCompile("(?i)https?://[^\\s<>\"'`]+")
+
+// firstLinkURL returns the first http(s) link of a message body, or an empty
+// string when the body carries none.
+func firstLinkURL(text string) string {
+	match := linkPattern.FindString(text)
+	if match == "" {
+		return ""
+	}
+	return strings.TrimRight(match, ".,;:!?)]}'\"")
+}
+
+// attachLinkPreview resolves the preview of the first link of a text message.
+// WhatsApp only ships a preview when the sending client built one, which is
+// rare, so the preview is resolved here. The fetch runs in the background:
+// the message is delivered and rendered right away, and the card appears once
+// the page answers.
+func (c *Client) attachLinkPreview(message domain.Message) {
+	if c.linkPreviews == nil || message.Kind != "text" || message.LinkPreview != nil {
+		return
+	}
+	rawURL := firstLinkURL(message.Text)
+	if rawURL == "" {
+		return
+	}
+	c.maintenanceWG.Add(1)
+	go func() {
+		defer c.maintenanceWG.Done()
+		preview, found := c.linkPreviews.Resolve(c.clientContext(), rawURL)
+		if !found {
+			return
+		}
+		c.applyLinkPreview(message, preview)
+	}()
+}
+
+// applyLinkPreview stores a resolved preview on an already persisted message
+// and notifies the desktop so the card is rendered.
+func (c *Client) applyLinkPreview(message domain.Message, preview linkpreview.Preview) {
+	ctx, cancel := context.WithTimeout(c.clientContext(), 15*time.Second)
+	defer cancel()
+	stored, err := c.store.Message(ctx, message.ChatJID, message.ID)
+	if err != nil {
+		c.logLinkPreviewWarning("load message for link preview", message, err)
+		return
+	}
+	stored.LinkPreview = linkPreviewFrom(preview)
+	if err = c.store.ApplyMessage(ctx, stored, false); err != nil {
+		c.logLinkPreviewWarning("store link preview", message, err)
+		return
+	}
+	if c.sink != nil {
+		c.sink(Event{Kind: "message", Message: stored})
+	}
+}
+
+// logLinkPreviewWarning reports a failed link preview update.
+func (c *Client) logLinkPreviewWarning(detail string, message domain.Message, err error) {
+	if c.log == nil {
+		return
+	}
+	c.log.Warn(detail, "chat_id", message.ChatJID, "message_id", message.ID, "error", err)
+}
+
+// linkPreviewFrom turns a resolved preview into the card payload the desktop
+// renders. The desktop expects raw JPEG bytes for the card image and no image
+// is fetched here, so the image URL is reported in the description instead of
+// an empty thumbnail.
+func linkPreviewFrom(preview linkpreview.Preview) *domain.LinkPreview {
+	description := preview.Description
+	if preview.ImageURL != "" {
+		description = joinNonEmpty("\n", description, preview.ImageURL)
+	}
+	return &domain.LinkPreview{URL: preview.URL, Title: preview.Title, Description: description}
+}
+
+// clientContext returns the client context, or a background context when the
+// client was built without one.
+func (c *Client) clientContext() context.Context {
+	if c.ctx != nil {
+		return c.ctx
+	}
+	return context.Background()
 }
 
 // fallbackMessageContent derives a human-readable label from whichever payload

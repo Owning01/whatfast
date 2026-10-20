@@ -2,12 +2,9 @@ mod native_notifications;
 mod proto;
 
 #[allow(dead_code)]
-#[path = "../../../desktop/src/bridge.rs"]
 mod bridge;
 #[allow(dead_code)]
-#[path = "../../../desktop/src/paths.rs"]
 mod paths;
-#[path = "../../../desktop/src/sticker.rs"]
 mod sticker;
 
 #[cfg(target_os = "linux")]
@@ -25,9 +22,17 @@ use std::{
 
 use proto::{rpc_request, rpc_response};
 use serde::Serialize;
-use tauri::{Emitter as _, Manager as _, ipc::Channel};
+use image::{AnimationDecoder as _, GenericImageView as _};
+use tauri::{
+    Emitter as _, Manager as _,
+    ipc::Channel,
+    menu::{Menu, MenuItem, PredefinedMenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
+    WindowEvent,
+};
 use tauri_plugin_clipboard_manager::ClipboardExt as _;
 use tauri_plugin_opener::OpenerExt as _;
+use tauri_plugin_window_state::AppHandleExt as _;
 use tokio::sync::{Mutex, oneshot};
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -40,6 +45,20 @@ const ATTACHMENT_TIMEOUT: Duration = Duration::from_secs(22 * 60);
 const MAX_PASTED_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PASTED_IMAGE_PIXELS: u64 = 16_000_000;
 const MAX_PASTED_IMAGE_EDGE: u32 = 8_192;
+// Desktop-core owned temporary caches. Files here exist only between a pick
+// (paste or recording) and the completed send, so both discard and crash
+// cleanup must cover every root, not just the pasted-image one.
+const STAGED_CACHE_DIRS: [&str; 3] = ["pasted-images", "voice-notes", "staged-outgoing"];
+// Media the user picked is copied here before the backend ever sees it, so
+// the webview can only hand over files the core has already inspected.
+const STAGED_OUTGOING_DIR: &str = "staged-outgoing";
+const MAX_STAGED_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_STAGED_DOCUMENT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_STAGED_IMAGE_EDGE: u32 = 8_192;
+const MAX_STAGED_IMAGE_PIXELS: u64 = 16_000_000;
+// A chat muted "indefinitely" is stored as a far-future instant so the same
+// column covers both cases. 9999-12-31T23:59:59.999Z in Unix milliseconds.
+const INDEFINITE_MUTE_UNTIL_MS: i64 = 253_402_300_799_000;
 
 const MAX_PENDING_REQUESTS: usize = 512;
 const MAX_RESTART_ATTEMPTS: u32 = 5;
@@ -325,6 +344,11 @@ struct BridgeServiceInner {
     next_request_id: AtomicU64,
     epoch: AtomicU64,
     stopping: AtomicBool,
+    /// Set when the supervisor gives up after MAX_RESTART_ATTEMPTS
+    /// (retryExhausted) and stops without an active client. The user-driven
+    /// `reconnect` command is the recovery path: it resets this flag and
+    /// starts a fresh epoch with a new supervisor loop.
+    exhausted: AtomicBool,
     transport: StdMutex<TransportState>,
     subscribers: Arc<Mutex<Vec<Channel<FrontendEvent>>>>,
 }
@@ -338,6 +362,7 @@ impl BridgeServiceInner {
             next_request_id: AtomicU64::new(1),
             epoch: AtomicU64::new(1),
             stopping: AtomicBool::new(false),
+            exhausted: AtomicBool::new(false),
             transport: StdMutex::new(TransportState {
                 active: Some(ActiveClient {
                     epoch: 1,
@@ -443,6 +468,11 @@ impl BridgeServiceInner {
 
             loop {
                 if attempts >= MAX_RESTART_ATTEMPTS {
+                    // The supervisor stops here with no active client, so the
+                    // app would stay dead without recovery. Mark the terminal
+                    // state; the user-driven `reconnect` command resets this
+                    // flag and restarts the supervisor on a new epoch.
+                    self.exhausted.store(true, Ordering::Release);
                     self.lifecycle(epoch, "retryExhausted", attempts, exit.message.clone())
                         .await;
                     return;
@@ -467,6 +497,7 @@ impl BridgeServiceInner {
                         });
                         self.lifecycle(epoch, "reconnected", attempts, String::new())
                             .await;
+                        self.exhausted.store(false, Ordering::Release);
                         break;
                     }
                     Err(error) => {
@@ -525,9 +556,31 @@ impl BridgeServiceInner {
                                         .into(),
                                 ))
                                 .await;
+                                // Tell the UI to refetch list_chats plus any
+                                // open message windows; only the event body is
+                                // handled below, never the sequence recovery.
+                                self.lifecycle(
+                                    epoch,
+                                    "resyncRequired",
+                                    0,
+                                    "Backend emitted an unsequenced event; refetch list_chats and open message windows".into(),
+                                )
+                                .await;
                                 continue;
                             }
-                            SequenceObservation::Stale => continue,
+                            SequenceObservation::Stale => {
+                                // A duplicate delivery carries no new state,
+                                // but the UI still needs the resync signal in
+                                // case it missed the original event.
+                                self.lifecycle(
+                                    epoch,
+                                    "resyncRequired",
+                                    0,
+                                    "Backend re-emitted an already-seen event; refetch list_chats and open message windows if state looks stale".into(),
+                                )
+                                .await;
+                                continue;
+                            }
                             SequenceObservation::Gap { expected, received } => {
                                 self.send(FrontendEvent::problem(
                                     "event_sequence_gap",
@@ -535,6 +588,15 @@ impl BridgeServiceInner {
                                         "Backend event gap (expected {expected}, received {received}); refresh may be required"
                                     ),
                                 ))
+                                .await;
+                                self.lifecycle(
+                                    epoch,
+                                    "resyncRequired",
+                                    0,
+                                    format!(
+                                        "Backend event gap (expected {expected}, received {received}); refetch list_chats and open message windows"
+                                    ),
+                                )
                                 .await;
                             }
                             SequenceObservation::Accept => {}
@@ -669,6 +731,13 @@ macro_rules! rpc_commands {
     };
 }
 
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 fn validate_client_message_id(client_message_id: String) -> Result<String, CommandError> {
     let parsed = uuid::Uuid::parse_str(&client_message_id).map_err(|_| {
         CommandError::invalid_argument("client_message_id must be a canonical UUID v4")
@@ -735,6 +804,13 @@ fn configure_asset_protocol_scope(
     // access beyond the backend-owned cache.
     scope.allow_directory(data_dir.join("media"), true)?;
     scope.allow_directory(data_dir.join("avatars"), false)?;
+    // The staging caches hold the copy of the picture the user is about to
+    // send, plus the clipboard paste and the recorded voice note. They are
+    // part of the profile directory, so the webview may render them and
+    // nothing else.
+    scope.allow_directory(data_dir.join(STAGED_OUTGOING_DIR), true)?;
+    scope.allow_directory(data_dir.join("pasted-images"), true)?;
+    scope.allow_directory(data_dir.join("voice-notes"), true)?;
     Ok(())
 }
 
@@ -1304,6 +1380,64 @@ fn stage_pasted_image_blocking(
 }
 
 #[tauri::command]
+async fn stage_voice_note(bytes: Vec<u8>, mime_type: String) -> Result<String, CommandError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        stage_voice_note_blocking(&paths::data_dir(), bytes, &mime_type)
+    })
+    .await
+    .map_err(|error| CommandError::transport(format!("voice note worker failed: {error}")))?
+}
+
+fn stage_voice_note_blocking(
+    data_dir: &Path,
+    bytes: Vec<u8>,
+    mime_type: &str,
+) -> Result<String, CommandError> {
+    if bytes.is_empty() || bytes.len() > MAX_PASTED_IMAGE_BYTES {
+        return Err(CommandError::invalid_argument(
+            "voice note must be between 1 byte and 32 MiB",
+        ));
+    }
+    let extension = match mime_type.to_ascii_lowercase().as_str() {
+        "audio/ogg" | "audio/ogg;codecs=opus" | "application/ogg" => "ogg",
+        "audio/webm" | "audio/webm;codecs=opus" => "webm",
+        _ => "webm",
+    };
+    let directory = data_dir.join("voice-notes");
+    std::fs::create_dir_all(&directory).map_err(|error| {
+        CommandError::open_failed(format!("create voice-note cache: {error}"))
+    })?;
+    let path = directory.join(format!("{}.{}", uuid::Uuid::new_v4(), extension));
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|error| CommandError::open_failed(format!("create voice note: {error}")))?;
+    if let Err(error) = std::io::Write::write_all(&mut file, &bytes) {
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err(CommandError::open_failed(format!(
+            "write voice note: {error}"
+        )));
+    }
+    drop(file);
+    match path.to_str() {
+        Some(path) => Ok(path.to_owned()),
+        None => {
+            let _ = std::fs::remove_file(&path);
+            Err(CommandError::open_failed(
+                "voice-note path is not valid UTF-8",
+            ))
+        }
+    }
+}
+
+#[tauri::command]
 async fn stage_clipboard_image(app: tauri::AppHandle) -> Result<String, CommandError> {
     // Clipboard image reads can block (and on Linux may deadlock the GTK main
     // thread), so keep both the native read and PNG normalization on a worker.
@@ -1348,19 +1482,33 @@ async fn stage_clipboard_image(app: tauri::AppHandle) -> Result<String, CommandE
 }
 
 fn discard_staged_image_blocking(data_dir: &Path, path: &Path) -> Result<(), CommandError> {
-    let root = std::fs::canonicalize(data_dir.join("pasted-images")).map_err(|error| {
-        CommandError::invalid_argument(format!("pasted image cache is unavailable: {error}"))
-    })?;
     let target = std::fs::canonicalize(path).map_err(|error| {
-        CommandError::invalid_argument(format!("pasted image is unavailable: {error}"))
+        CommandError::invalid_argument(format!("staged file is unavailable: {error}"))
     })?;
-    if !target.starts_with(root) || !target.is_file() {
+    // A staged file may belong to any owned cache root (pasted images or
+    // recorded voice notes). Accept it only when it resolves inside one of
+    // them, so the webview can never delete arbitrary user files.
+    let inside_cache = STAGED_CACHE_DIRS.iter().any(|name| {
+        std::fs::canonicalize(data_dir.join(name))
+            .map(|root| target.starts_with(root))
+            .unwrap_or(false)
+    });
+    if !inside_cache || !target.is_file() {
         return Err(CommandError::invalid_argument(
-            "path is outside the pasted image cache",
+            "path is outside the staged file caches",
         ));
     }
-    std::fs::remove_file(target)
-        .map_err(|error| CommandError::open_failed(format!("remove pasted image: {error}")))
+    let parent = target.parent().map(Path::to_path_buf);
+    std::fs::remove_file(&target)
+        .map_err(|error| CommandError::open_failed(format!("remove staged file: {error}")))?;
+    // Staged outgoing media lives in a per-file directory. Remove it once the
+    // file is gone so the cache does not accumulate empty folders.
+    if let Some(parent) = parent
+        && parent.starts_with(data_dir.join(STAGED_OUTGOING_DIR))
+    {
+        let _ = std::fs::remove_dir(parent);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1372,16 +1520,363 @@ async fn discard_staged_image(path: String) -> Result<(), CommandError> {
     .map_err(|error| CommandError::transport(format!("clipboard cleanup worker failed: {error}")))?
 }
 
-fn clear_staged_images(data_dir: &Path) {
-    let directory = data_dir.join("pasted-images");
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if entry.file_type().is_ok_and(|file_type| file_type.is_file()) {
-            let _ = std::fs::remove_file(entry.path());
+fn clear_staged_files(data_dir: &Path) {
+    for name in STAGED_CACHE_DIRS {
+        let directory = data_dir.join(name);
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_file() {
+                let _ = std::fs::remove_file(entry.path());
+            } else if file_type.is_dir() {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
         }
     }
+}
+
+/// A file the desktop core accepted for sending, together with the staged
+/// path the backend must read from.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StagedMedia {
+    path: String,
+    file_name: String,
+    mime_type: String,
+    size: u64,
+    width: u32,
+    height: u32,
+}
+
+fn sanitize_file_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | ' ') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.').to_owned();
+    let capped: String = trimmed.chars().take(120).collect();
+    if capped.is_empty() {
+        "media".to_owned()
+    } else {
+        capped
+    }
+}
+
+fn image_mime_type(format: image::ImageFormat) -> Option<&'static str> {
+    match format {
+        image::ImageFormat::Jpeg => Some("image/jpeg"),
+        image::ImageFormat::Png => Some("image/png"),
+        image::ImageFormat::Gif => Some("image/gif"),
+        image::ImageFormat::WebP => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// Animated images cannot be cropped without dropping frames, so the editor
+/// refuses them instead of silently flattening the animation.
+fn is_animated_image(bytes: &[u8], format: image::ImageFormat) -> bool {
+    match format {
+        image::ImageFormat::Gif => {
+            let Ok(decoder) = image::codecs::gif::GifDecoder::new(Cursor::new(bytes)) else {
+                return false;
+            };
+            decoder.into_frames().count() > 1
+        }
+        image::ImageFormat::WebP => bytes
+            .windows(4)
+            .any(|window| window == b"ANIM" || window == b"ANMF"),
+        _ => false,
+    }
+}
+
+fn read_file_header(path: &Path) -> Result<Vec<u8>, CommandError> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| CommandError::invalid_argument(format!("media file is unavailable: {error}")))?;
+    let mut header = vec![0_u8; 32];
+    let read = file
+        .read(&mut header)
+        .map_err(|error| CommandError::open_failed(format!("read media header: {error}")))?;
+    header.truncate(read);
+    Ok(header)
+}
+
+/// Validate a user-picked media file and copy it into the core-owned staging
+/// area. The staged path is the only thing the backend is ever allowed to
+/// read for an outgoing attachment.
+fn stage_outgoing_media_blocking(
+    data_dir: &Path,
+    path: &str,
+    kind: &str,
+) -> Result<StagedMedia, CommandError> {
+    let source = Path::new(path);
+    if !source.is_absolute() {
+        return Err(CommandError::invalid_argument("media path must be absolute"));
+    }
+    let metadata = std::fs::symlink_metadata(source).map_err(|error| {
+        CommandError::invalid_argument(format!("media file is unavailable: {error}"))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(CommandError::invalid_argument(
+            "media path must not be a symbolic link",
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(CommandError::invalid_argument(
+            "media path must be a regular file",
+        ));
+    }
+    let size = metadata.len();
+    if size == 0 {
+        return Err(CommandError::invalid_argument("media file is empty"));
+    }
+    let wants_image = matches!(kind, "image" | "sticker");
+    let limit = if wants_image {
+        MAX_STAGED_IMAGE_BYTES
+    } else {
+        MAX_STAGED_DOCUMENT_BYTES
+    };
+    if size > limit {
+        return Err(CommandError::invalid_argument(format!(
+            "media file exceeds the {} byte limit",
+            limit
+        )));
+    }
+
+    let header = read_file_header(source)?;
+    let format = image::guess_format(&header).map_err(|_| {
+        CommandError::invalid_argument("media file is not a supported image")
+    })?;
+    let mime_type = image_mime_type(format).ok_or_else(|| {
+        CommandError::invalid_argument("only JPEG, PNG, GIF, and WebP images are supported")
+    })?;
+    if wants_image {
+        let (width, height) = image::ImageReader::open(source)
+            .map_err(|error| {
+                CommandError::invalid_argument(format!("media file is not readable: {error}"))
+            })?
+            .into_dimensions()
+            .map_err(|error| {
+                CommandError::invalid_argument(format!("media dimensions are invalid: {error}"))
+            })?;
+        if width == 0
+            || height == 0
+            || width > MAX_STAGED_IMAGE_EDGE
+            || height > MAX_STAGED_IMAGE_EDGE
+            || u64::from(width) * u64::from(height) > MAX_STAGED_IMAGE_PIXELS
+        {
+            return Err(CommandError::invalid_argument(
+                "media dimensions are too large",
+            ));
+        }
+    }
+
+    let file_name = sanitize_file_name(
+        source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("media"),
+    );
+    let directory = data_dir
+        .join(STAGED_OUTGOING_DIR)
+        .join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&directory).map_err(|error| {
+        CommandError::open_failed(format!("create outgoing media cache: {error}"))
+    })?;
+    let target = directory.join(&file_name);
+    if let Err(error) = std::fs::copy(source, &target) {
+        let _ = std::fs::remove_dir_all(&directory);
+        return Err(CommandError::open_failed(format!(
+            "copy media into the staging cache: {error}"
+        )));
+    }
+    let (width, height) = if wants_image {
+        image::ImageReader::open(&target)
+            .ok()
+            .and_then(|reader| reader.into_dimensions().ok())
+            .unwrap_or((0, 0))
+    } else {
+        (0, 0)
+    };
+    Ok(StagedMedia {
+        path: target.to_string_lossy().into_owned(),
+        file_name,
+        mime_type: mime_type.to_owned(),
+        size,
+        width,
+        height,
+    })
+}
+
+#[tauri::command]
+async fn stage_outgoing_media(path: String, kind: String) -> Result<StagedMedia, CommandError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        stage_outgoing_media_blocking(&paths::data_dir(), &path, &kind)
+    })
+    .await
+    .map_err(|error| CommandError::transport(format!("media staging worker failed: {error}")))?
+}
+
+/// Only files the core staged (or recorded) may be handed to the backend.
+fn staged_media_path(data_dir: &Path, requested: &str) -> Result<PathBuf, CommandError> {
+    let target = Path::new(requested);
+    if !target.is_absolute() {
+        return Err(CommandError::invalid_argument("media path must be absolute"));
+    }
+    let canonical = std::fs::canonicalize(target).map_err(|error| {
+        CommandError::invalid_argument(format!("media file is unavailable: {error}"))
+    })?;
+    for name in [STAGED_OUTGOING_DIR, "pasted-images", "voice-notes"] {
+        let Ok(root) = std::fs::canonicalize(data_dir.join(name)) else {
+            continue;
+        };
+        if canonical.starts_with(&root) {
+            return Ok(canonical);
+        }
+    }
+    Err(CommandError::invalid_argument(
+        "media must be staged by the desktop before it can be sent",
+    ))
+}
+
+/// Crop and rotate a picture, then stage the result for sending.
+///
+/// The crop rectangle is expressed in the pixels of the ROTATED picture, so
+/// the desktop can draw it directly on the preview it shows. The rotation is
+/// clockwise and must be one of 0, 90, 180 or 270 degrees.
+#[tauri::command]
+async fn edit_image(
+    path: String,
+    rotation: u32,
+    crop_x: u32,
+    crop_y: u32,
+    crop_width: u32,
+    crop_height: u32,
+) -> Result<StagedMedia, CommandError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        edit_image_blocking(
+            &paths::data_dir(),
+            &path,
+            rotation,
+            crop_x,
+            crop_y,
+            crop_width,
+            crop_height,
+        )
+    })
+    .await
+    .map_err(|error| CommandError::transport(format!("image editor worker failed: {error}")))?
+}
+
+fn edit_image_blocking(
+    data_dir: &Path,
+    path: &str,
+    rotation: u32,
+    crop_x: u32,
+    crop_y: u32,
+    crop_width: u32,
+    crop_height: u32,
+) -> Result<StagedMedia, CommandError> {
+    let source = Path::new(path);
+    if !source.is_absolute() {
+        return Err(CommandError::invalid_argument("image path must be absolute"));
+    }
+    let metadata = std::fs::symlink_metadata(source).map_err(|error| {
+        CommandError::invalid_argument(format!("image file is unavailable: {error}"))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(CommandError::invalid_argument(
+            "image path must be a regular file",
+        ));
+    }
+    if metadata.len() == 0 || metadata.len() > MAX_STAGED_IMAGE_BYTES {
+        return Err(CommandError::invalid_argument(
+            "image must be between 1 byte and 32 MiB",
+        ));
+    }
+    let header = read_file_header(source)?;
+    let format = image::guess_format(&header)
+        .map_err(|_| CommandError::invalid_argument("image format is not supported"))?;
+    let mime_type = image_mime_type(format).ok_or_else(|| {
+        CommandError::invalid_argument("only JPEG, PNG, GIF, and WebP images can be edited")
+    })?;
+    if is_animated_image(&header, format) {
+        return Err(CommandError::invalid_argument(
+            "animated images cannot be edited",
+        ));
+    }
+    let decoded = image::open(source).map_err(|error| {
+        CommandError::invalid_argument(format!("image could not be decoded: {error}"))
+    })?;
+    let rotated = match rotation {
+        0 => decoded,
+        90 => decoded.rotate90(),
+        180 => decoded.rotate180(),
+        270 => decoded.rotate270(),
+        _ => {
+            return Err(CommandError::invalid_argument(
+                "rotation must be 0, 90, 180 or 270 degrees",
+            ));
+        }
+    };
+    let (source_width, source_height) = rotated.dimensions();
+    if crop_width == 0 || crop_height == 0 {
+        return Err(CommandError::invalid_argument("crop must cover at least one pixel"));
+    }
+    if crop_x + crop_width > source_width || crop_y + crop_height > source_height {
+        return Err(CommandError::invalid_argument(
+            "crop falls outside the rotated image",
+        ));
+    }
+    let cropped = image::imageops::crop_imm(
+        &rotated,
+        crop_x,
+        crop_y,
+        crop_width,
+        crop_height,
+    )
+    .to_image();
+
+    let extension = match format {
+        image::ImageFormat::Png => "png",
+        image::ImageFormat::Gif => "gif",
+        image::ImageFormat::WebP => "webp",
+        _ => "jpg",
+    };
+    let file_name = format!("edited.{extension}");
+    let directory = data_dir
+        .join(STAGED_OUTGOING_DIR)
+        .join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&directory).map_err(|error| {
+        CommandError::open_failed(format!("create edited image cache: {error}"))
+    })?;
+    let target = directory.join(&file_name);
+    if let Err(error) = cropped.save(&target) {
+        let _ = std::fs::remove_dir_all(&directory);
+        return Err(CommandError::open_failed(format!(
+            "write edited image: {error}"
+        )));
+    }
+    let size = std::fs::metadata(&target).map(|meta| meta.len()).unwrap_or(0);
+    let (width, height) = cropped.dimensions();
+    Ok(StagedMedia {
+        path: target.to_string_lossy().into_owned(),
+        file_name,
+        mime_type: mime_type.to_owned(),
+        size,
+        width,
+        height,
+    })
 }
 
 /// Copy one cached media file into a user-chosen directory.
@@ -1499,10 +1994,6 @@ rpc_commands! {
         rpc_request::Request::StartPairing(proto::StartPairingRequest {}),
         WRITE_TIMEOUT => StartPairing
     }
-    reconnect() -> proto::ReconnectResponse {
-        rpc_request::Request::Reconnect(proto::ReconnectRequest {}),
-        CONTROL_TIMEOUT => Reconnect
-    }
     get_sync_status() -> proto::SyncStatusResponse {
         rpc_request::Request::GetSyncStatus(proto::GetSyncStatusRequest {}),
         CONTROL_TIMEOUT => SyncStatus
@@ -1606,12 +2097,68 @@ rpc_commands! {
         rpc_request::Request::SendImage(proto::SendImageRequest {
                 client_message_id: validate_client_message_id(client_message_id)?,
                 chat_id,
-                image_path,
+                image_path: staged_media_path(&paths::data_dir(), &image_path)?
+                    .to_string_lossy()
+                    .into_owned(),
                 caption,
                 reply_to_message_id,
                 reply_to_chat_id,
-            }), WRITE_TIMEOUT => SendImage
+            }), ATTACHMENT_TIMEOUT => SendImage
     }
+}
+
+/// User-driven reconnect. Besides forwarding the Reconnect RPC on a live
+/// epoch, this is the recovery path after the supervisor emits
+/// retryExhausted: that state leaves no active client and stops the
+/// supervisor loop, so a plain RPC would only fail with
+/// backend_reconnecting. Here the backoff is reset and a new epoch with a
+/// fresh backend client is handed to a new supervisor loop.
+#[tauri::command]
+async fn reconnect(
+    state: tauri::State<'_, BridgeService>,
+) -> Result<proto::ReconnectResponse, CommandError> {
+    if state.exhausted.swap(false, Ordering::AcqRel) {
+        if state.stopping.load(Ordering::Acquire) {
+            return Err(CommandError::shutting_down());
+        }
+        let next = match bridge::BackendClient::start(state.fake) {
+            Ok(next) => next,
+            Err(error) => {
+                state.exhausted.store(true, Ordering::Release);
+                return Err(CommandError::transport(error.to_string()));
+            }
+        };
+        let epoch = state.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let client = Arc::new(next);
+        state
+            .transport
+            .lock()
+            .expect("bridge transport lock poisoned")
+            .active = Some(ActiveClient {
+            epoch,
+            client: client.clone(),
+        });
+        state
+            .lifecycle(
+                epoch,
+                "reconnecting",
+                1,
+                "manual reconnect after retryExhausted".into(),
+            )
+            .await;
+        let supervisor: BridgeService = (*state).clone();
+        tauri::async_runtime::spawn(async move {
+            supervisor.run_supervisor(client, epoch).await;
+        });
+        return Ok(proto::ReconnectResponse { started: true });
+    }
+    let result = state
+        .request(
+            rpc_request::Request::Reconnect(proto::ReconnectRequest {}),
+            CONTROL_TIMEOUT,
+        )
+        .await?;
+    expect_response!(result, Reconnect)
 }
 
 #[tauri::command]
@@ -1647,6 +2194,29 @@ async fn send_sticker(
 }
 
 rpc_commands! {
+    list_stickers() -> proto::ListStickersResponse {
+        rpc_request::Request::ListStickers(proto::ListStickersRequest {}),
+        READ_TIMEOUT => ListStickers
+    }
+    send_sticker_from_library(
+        client_message_id: String,
+        chat_id: String,
+        sticker_id: String,
+        reply_to_message_id: String,
+        reply_to_chat_id: String,
+    ) -> proto::SendStickerFromLibraryResponse {
+        rpc_request::Request::SendStickerFromLibrary(proto::SendStickerFromLibraryRequest {
+                client_message_id: validate_client_message_id(client_message_id)?,
+                chat_id,
+                sticker_id,
+                reply_to_message_id,
+                reply_to_chat_id,
+            }), WRITE_TIMEOUT => SendStickerFromLibrary
+    }
+    shutdown() -> proto::ShutdownResponse {
+        rpc_request::Request::Shutdown(proto::ShutdownRequest {}),
+        CONTROL_TIMEOUT => Shutdown
+    }
     get_message_image(
         chat_id: String,
         message_id: String,
@@ -1654,7 +2224,7 @@ rpc_commands! {
         rpc_request::Request::GetMessageImage(proto::GetMessageImageRequest {
             chat_id,
             message_id,
-        }), READ_TIMEOUT => GetMessageImage
+        }), ATTACHMENT_TIMEOUT => GetMessageImage
     }
     get_message_attachment(
         chat_id: String,
@@ -1684,6 +2254,9 @@ async fn send_attachment(
 ) -> Result<proto::SendAttachmentResponse, CommandError> {
     let client_message_id = validate_client_message_id(client_message_id)?;
     let kind = validate_attachment_kind(kind, &caption, voice_note)?;
+    let file_path = staged_media_path(&paths::data_dir(), &file_path)?
+        .to_string_lossy()
+        .into_owned();
     let result = state
         .request(
             rpc_request::Request::SendAttachment(proto::SendAttachmentRequest {
@@ -1700,6 +2273,124 @@ async fn send_attachment(
         )
         .await?;
     expect_response!(result, SendAttachment)
+}
+
+// Archive, mute and block are chat settings the linked-device transport does
+// not expose as app-state, so the backend stores them per desktop profile.
+// The commands mirror the frontend's vocabulary and translate it into the
+// single boolean RPC the protocol carries.
+#[tauri::command]
+async fn archive_chat(
+    state: tauri::State<'_, BridgeService>,
+    chat_id: String,
+) -> Result<proto::SetChatArchiveResponse, CommandError> {
+    let result = state
+        .request(
+            rpc_request::Request::SetChatArchive(proto::SetChatArchiveRequest {
+                chat_id,
+                archived: true,
+            }),
+            WRITE_TIMEOUT,
+        )
+        .await?;
+    expect_response!(result, SetChatArchive)
+}
+
+#[tauri::command]
+async fn unarchive_chat(
+    state: tauri::State<'_, BridgeService>,
+    chat_id: String,
+) -> Result<proto::SetChatArchiveResponse, CommandError> {
+    let result = state
+        .request(
+            rpc_request::Request::SetChatArchive(proto::SetChatArchiveRequest {
+                chat_id,
+                archived: false,
+            }),
+            WRITE_TIMEOUT,
+        )
+        .await?;
+    expect_response!(result, SetChatArchive)
+}
+
+/// `duration_ms` is the mute length: `None` mutes the chat indefinitely and
+/// `Some(0)` is treated as an indefinite mute as well.
+#[tauri::command]
+async fn mute_chat(
+    state: tauri::State<'_, BridgeService>,
+    chat_id: String,
+    duration_ms: Option<i64>,
+) -> Result<proto::SetChatMuteResponse, CommandError> {
+    let mute_until_ms = match duration_ms {
+        Some(duration) if duration > 0 => now_millis().saturating_add(duration),
+        Some(duration) if duration < 0 => {
+            return Err(CommandError::invalid_argument(
+                "mute duration must not be negative",
+            ));
+        }
+        _ => INDEFINITE_MUTE_UNTIL_MS,
+    };
+    let result = state
+        .request(
+            rpc_request::Request::SetChatMute(proto::SetChatMuteRequest {
+                chat_id,
+                mute_until_ms,
+            }),
+            WRITE_TIMEOUT,
+        )
+        .await?;
+    expect_response!(result, SetChatMute)
+}
+
+#[tauri::command]
+async fn unmute_chat(
+    state: tauri::State<'_, BridgeService>,
+    chat_id: String,
+) -> Result<proto::SetChatMuteResponse, CommandError> {
+    let result = state
+        .request(
+            rpc_request::Request::SetChatMute(proto::SetChatMuteRequest {
+                chat_id,
+                mute_until_ms: 0,
+            }),
+            WRITE_TIMEOUT,
+        )
+        .await?;
+    expect_response!(result, SetChatMute)
+}
+
+#[tauri::command]
+async fn block_chat(
+    state: tauri::State<'_, BridgeService>,
+    chat_id: String,
+) -> Result<proto::SetChatBlockResponse, CommandError> {
+    let result = state
+        .request(
+            rpc_request::Request::SetChatBlock(proto::SetChatBlockRequest {
+                chat_id,
+                blocked: true,
+            }),
+            WRITE_TIMEOUT,
+        )
+        .await?;
+    expect_response!(result, SetChatBlock)
+}
+
+#[tauri::command]
+async fn unblock_chat(
+    state: tauri::State<'_, BridgeService>,
+    chat_id: String,
+) -> Result<proto::SetChatBlockResponse, CommandError> {
+    let result = state
+        .request(
+            rpc_request::Request::SetChatBlock(proto::SetChatBlockRequest {
+                chat_id,
+                blocked: false,
+            }),
+            WRITE_TIMEOUT,
+        )
+        .await?;
+    expect_response!(result, SetChatBlock)
 }
 
 rpc_commands! {
@@ -1810,6 +2501,35 @@ rpc_commands! {
                 text,
             }), WRITE_TIMEOUT => EditMessage
     }
+    delete_message(
+        chat_id: String,
+        message_id: String,
+        delete_for_everyone: bool,
+    ) -> proto::DeleteMessageResponse {
+        rpc_request::Request::DeleteMessage(proto::DeleteMessageRequest {
+                chat_id,
+                message_id,
+                delete_for_everyone,
+            }), WRITE_TIMEOUT => DeleteMessage
+    }
+    list_statuses() -> proto::ListStatusesResponse {
+        rpc_request::Request::ListStatuses(proto::ListStatusesRequest {}), READ_TIMEOUT => ListStatuses
+    }
+    subscribe_newsletter(invite_key: String) -> proto::SubscribeNewsletterResponse {
+        rpc_request::Request::SubscribeNewsletter(proto::SubscribeNewsletterRequest { invite_key }), WRITE_TIMEOUT => SubscribeNewsletter
+    }
+    list_newsletters() -> proto::ListNewslettersResponse {
+        rpc_request::Request::ListNewsletters(proto::ListNewslettersRequest {}), READ_TIMEOUT => ListNewsletters
+    }
+    list_newsletter_messages(jid: String, limit: i32) -> proto::ListNewsletterMessagesResponse {
+        rpc_request::Request::ListNewsletterMessages(proto::ListNewsletterMessagesRequest { jid, limit }), READ_TIMEOUT => ListNewsletterMessages
+    }
+    unsubscribe_newsletter(jid: String) -> proto::UnsubscribeNewsletterResponse {
+        rpc_request::Request::UnsubscribeNewsletter(proto::UnsubscribeNewsletterRequest { jid }), WRITE_TIMEOUT => UnsubscribeNewsletter
+    }
+    set_chat_pin(chat_id: String, pinned: bool) -> proto::SetChatPinResponse {
+        rpc_request::Request::SetChatPin(proto::SetChatPinRequest { chat_id, pinned }), WRITE_TIMEOUT => SetChatPin
+    }
     logout() -> proto::LogoutResponse {
         rpc_request::Request::Logout(proto::LogoutRequest {}),
         WRITE_TIMEOUT => Logout
@@ -1856,6 +2576,56 @@ fn mark_performance_idle_ready() -> Result<(), CommandError> {
     })
 }
 
+fn create_tray(app: &tauri::App) -> tauri::Result<TrayIcon<tauri::Wry>> {
+    let open = MenuItem::with_id(app, "open", "Abrir Whatfast", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Cerrar", true, None::<&str>)?;
+    let menu = Menu::with_items(
+        app,
+        &[&open, &PredefinedMenuItem::separator(app)?, &quit],
+    )?;
+    let icon = app
+        .default_window_icon()
+        .cloned()
+        .expect("bundle icon must be configured");
+    TrayIconBuilder::with_id("whatfast-tray")
+        .icon(icon)
+        .tooltip("Whatfast")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "open" => focus_main_window(app),
+            "quit" => {
+                // WhatsApp Desktop quits gracefully: request a backend
+                // Shutdown and reap the child before exiting the shell.
+                // CloseRequested above only hides to the tray.
+                app.state::<BridgeService>().begin_shutdown();
+                app.exit(0);
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if matches!(
+                event,
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                }
+            ) {
+                focus_main_window(tray.app_handle());
+            }
+        })
+        .build(app)
+}
+
+fn focus_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
 pub fn run() {
     let args = std::env::args().collect::<Vec<_>>();
     let performance_config = performance_capture_config_from_env();
@@ -1876,6 +2646,7 @@ pub fn run() {
             }
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
+                let _ = window.unminimize();
                 let _ = window.set_focus();
             }
         }));
@@ -1884,10 +2655,36 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
-        .setup(|app| {
-            // Files here are needed only between a paste and its completed
-            // send. Anything present at process start is residue from a crash.
-            clear_staged_images(&paths::data_dir());
+        .plugin(tauri_plugin_window_state::Builder::default().build())
+        .on_window_event(move |window, event| {
+            if !isolated_performance_process
+                && window.label() == "main"
+                && matches!(event, WindowEvent::CloseRequested { .. })
+            {
+                let WindowEvent::CloseRequested { api, .. } = event else {
+                    return;
+                };
+                api.prevent_close();
+                // The close button only hides to the tray, so persist the
+                // window geometry here — the destroy event that normally
+                // triggers the window-state plugin only fires on real quit.
+                // VISIBLE is excluded: the window is being hidden right now,
+                // and restoring a "hidden" window on next launch would start
+                // the app invisibly in the tray.
+                use tauri_plugin_window_state::StateFlags as State;
+                let flags = State::SIZE | State::POSITION | State::MAXIMIZED | State::DECORATIONS | State::FULLSCREEN;
+                let _ = window.app_handle().save_window_state(flags);
+                let _ = window.hide();
+            }
+        })
+        .setup(move |app| {
+            if !isolated_performance_process {
+                app.manage(create_tray(app)?);
+            }
+            // Files here are needed only between a paste or recording and its
+            // completed send. Anything present at process start is residue
+            // from a crash.
+            clear_staged_files(&paths::data_dir());
             configure_asset_protocol_scope(&app.asset_protocol_scope(), &paths::data_dir())?;
             let fake = std::env::args().any(|argument| argument == "--fake-backend");
             app.manage(BridgeServiceInner::start(fake)?);
@@ -1902,6 +2699,8 @@ pub fn run() {
             save_media_as,
             stage_clipboard_image,
             discard_staged_image,
+            stage_outgoing_media,
+            edit_image,
             show_message_notification,
             take_notification_activations,
             restart_app_command,
@@ -1925,6 +2724,8 @@ pub fn run() {
             send_text,
             send_image,
             send_sticker,
+            list_stickers,
+            send_sticker_from_library,
             send_attachment,
             get_message_image,
             get_message_attachment,
@@ -1941,7 +2742,22 @@ pub fn run() {
             list_pinned_messages,
             forward_message,
             edit_message,
+            delete_message,
+            list_statuses,
+            subscribe_newsletter,
+            list_newsletters,
+            list_newsletter_messages,
+            unsubscribe_newsletter,
+            set_chat_pin,
+            archive_chat,
+            unarchive_chat,
+            mute_chat,
+            unmute_chat,
+            block_chat,
+            unblock_chat,
+            stage_voice_note,
             logout,
+            shutdown,
             complete_performance_capture,
             mark_performance_idle_ready,
             get_performance_capture_config,
@@ -1958,6 +2774,69 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edit_image_crops_and_rotates_into_the_staging_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("photo.png");
+        let mut buffer = image::RgbImage::new(40, 20);
+        for (x, y, pixel) in buffer.enumerate_pixels_mut() {
+            pixel.0 = [(x % 256) as u8, (y % 256) as u8, 40];
+        }
+        image::DynamicImage::ImageRgb8(buffer).save(&source).unwrap();
+
+        // A quarter turn turns 40x20 into 20x40, and the crop is expressed in
+        // the pixels of the rotated picture.
+        let staged = edit_image_blocking(
+            root.path(),
+            source.to_str().unwrap(),
+            90,
+            0,
+            0,
+            10,
+            20,
+        )
+        .unwrap();
+        assert_eq!((staged.width, staged.height), (10, 20));
+        assert!(
+            Path::new(&staged.path).starts_with(root.path().join(STAGED_OUTGOING_DIR)),
+            "edited image must land in the staging cache: {}",
+            staged.path
+        );
+        let decoded = image::open(&staged.path).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (10, 20));
+    }
+
+    #[test]
+    fn edit_image_refuses_a_crop_outside_the_rotated_picture() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("photo.png");
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(40, 20))
+            .save(&source)
+            .unwrap();
+        let error = edit_image_blocking(root.path(), source.to_str().unwrap(), 0, 0, 0, 100, 100)
+            .expect_err("a crop outside the picture must be refused");
+        assert!(
+            error.message.contains("crop falls outside"),
+            "unexpected error: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn staged_media_path_accepts_only_core_owned_caches() {
+        let root = tempfile::tempdir().unwrap();
+        let staging = root.path().join(STAGED_OUTGOING_DIR).join("batch");
+        std::fs::create_dir_all(&staging).unwrap();
+        let staged = staging.join("photo.jpg");
+        std::fs::write(&staged, b"test").unwrap();
+        let outside = root.path().join("secret.txt");
+        std::fs::write(&outside, b"test").unwrap();
+
+        assert!(staged_media_path(root.path(), staged.to_str().unwrap()).is_ok());
+        assert!(staged_media_path(root.path(), outside.to_str().unwrap()).is_err());
+        assert!(staged_media_path(root.path(), "relative.jpg").is_err());
+    }
 
     #[test]
     fn event_sequence_accepts_ordered_events_and_reports_gaps() {
@@ -2326,9 +3205,29 @@ mod tests {
 
         let residue = staged.join("crashed-send.png");
         std::fs::write(&residue, b"stale").unwrap();
-        clear_staged_images(root.path());
+        clear_staged_files(root.path());
         assert!(!residue.exists());
         assert!(outside.exists());
+    }
+
+    #[test]
+    fn voice_notes_are_staged_privately_discarded_and_cleaned_up() {
+        let root = tempfile::tempdir().unwrap();
+        let path = PathBuf::from(
+            stage_voice_note_blocking(root.path(), vec![1, 2, 3, 4], "audio/ogg;codecs=opus")
+                .unwrap(),
+        );
+        assert!(path.starts_with(root.path().join("voice-notes")));
+        assert_eq!(path.extension().and_then(|value| value.to_str()), Some("ogg"));
+        assert_eq!(std::fs::read(&path).unwrap(), vec![1, 2, 3, 4]);
+
+        discard_staged_image_blocking(root.path(), &path).unwrap();
+        assert!(!path.exists());
+
+        let residue = root.path().join("voice-notes").join("crashed-send.webm");
+        std::fs::write(&residue, b"stale").unwrap();
+        clear_staged_files(root.path());
+        assert!(!residue.exists());
     }
 
     #[test]

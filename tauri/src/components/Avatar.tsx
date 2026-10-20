@@ -1,4 +1,4 @@
-import { Show } from "solid-js";
+import { createEffect, createSignal, Show } from "solid-js";
 import { UsersRound } from "lucide-solid";
 import { assetUrl } from "../lib/bridge";
 import { hueFor, initials } from "../lib/format";
@@ -9,11 +9,20 @@ interface AvatarProps {
   size?: number;
   group?: boolean;
   class?: string;
+  onClick?: (event: MouseEvent) => void;
 }
 
 export function Avatar(props: AvatarProps) {
   const size = () => props.size ?? 44;
-  const imageUrl = () => assetUrl(props.path) ?? "";
+  const [loadError, setLoadError] = createSignal(false);
+
+  createEffect(() => {
+    // Reset load error if path changes
+    props.path;
+    setLoadError(false);
+  });
+
+  const imageUrl = () => (!loadError() && props.path ? assetUrl(props.path) : "");
 
   return (
     <div
@@ -23,8 +32,10 @@ export function Avatar(props: AvatarProps) {
         height: `${size()}px`,
         "min-width": `${size()}px`,
         "--avatar-hue": `${hueFor(props.name)}`,
+        cursor: props.onClick ? "pointer" : undefined,
       }}
       aria-label={props.name}
+      onClick={props.onClick}
     >
       <Show
         when={imageUrl()}
@@ -34,7 +45,13 @@ export function Avatar(props: AvatarProps) {
           </Show>
         }
       >
-        <img src={imageUrl()} alt="" loading="lazy" draggable={false} />
+        <img
+          src={imageUrl()}
+          alt=""
+          loading="lazy"
+          draggable={false}
+          onError={() => setLoadError(true)}
+        />
       </Show>
     </div>
   );

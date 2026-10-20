@@ -7,6 +7,7 @@ import {
   MessageStatus,
   type AttachmentContent, type Chat, type ChatInfo, type ChatParticipant,
   type FrontendEventPayload, type Message, type MessageContent, type Reaction, type PinnedMessage,
+  type StagedMedia,
 } from "./types";
 import type {
   BackendEventHandler, BackendSubscription, BridgeApi, FilePickerOptions,
@@ -14,7 +15,7 @@ import type {
 } from "./bridge";
 
 const OWN_USER_ID = "919900001111@s.whatsapp.net";
-const PROTOCOL_VERSION = 20;
+const PROTOCOL_VERSION = 21;
 const STARTED_AT = Date.now();
 const MINUTE = 60_000;
 const DAY = 86_400_000;
@@ -34,7 +35,24 @@ export interface BrowserMockControl {
   blockChat(chatId: string, blocked?: boolean): void;
   receiveMessage(chatId: string, text?: string): void;
   setLiveEvents(enabled: boolean): void;
+  setOffline(enabled: boolean): void;
 }
+
+const STICKER_PACKS = [
+  { id: "pack-fun", name: "Fun Faces", stickerIds: ["fun-joy", "fun-laugh", "fun-wow", "fun-love"] },
+  { id: "pack-pets", name: "Party Pets", stickerIds: ["pet-cat", "pet-dog", "pet-panda", "pet-frog"] },
+] as const;
+
+const STICKER_LABELS: Record<string, string> = {
+  "fun-joy": "😂",
+  "fun-laugh": "🤣",
+  "fun-wow": "😮",
+  "fun-love": "😍",
+  "pet-cat": "🐱",
+  "pet-dog": "🐶",
+  "pet-panda": "🐼",
+  "pet-frog": "🐸",
+};
 
 declare global {
   interface Window {
@@ -57,6 +75,100 @@ export function stageBrowserFile(file: File): string {
 
 export function browserFileName(path: string): string {
   return browserFiles.get(path)?.fileName ?? "";
+}
+
+/**
+ * Browser-dev counterpart of the desktop core's media staging. A browser
+ * cannot copy into the profile directory, so the picked blob URL is already
+ * the staged file; only the metadata is filled in.
+ */
+export async function stageBrowserMedia(
+  path: string,
+  kind: "image" | "sticker" | "attachment",
+): Promise<StagedMedia> {
+  const metadata = browserFiles.get(path);
+  if (!metadata) {
+    throw new Error("The picked file is no longer available");
+  }
+  const isImage = kind === "image" || kind === "sticker";
+  let width = 0;
+  let height = 0;
+  if (isImage) {
+    const bitmap = await createImageBitmap(await (await fetch(path)).blob());
+    width = bitmap.width;
+    height = bitmap.height;
+    bitmap.close();
+  }
+  return {
+    path,
+    fileName: metadata.fileName,
+    mimeType: metadata.mimeType,
+    size: metadata.fileSize,
+    width,
+    height,
+  };
+}
+
+/**
+ * Browser-dev counterpart of the desktop core's image editor. The crop is
+ * expressed in the pixels of the rotated picture, so the picture is rotated
+ * first and the crop is taken from the rotated canvas.
+ */
+export async function editBrowserMedia(params: {
+  path: string;
+  rotation: number;
+  cropX: number;
+  cropY: number;
+  cropWidth: number;
+  cropHeight: number;
+}): Promise<StagedMedia> {
+  const blob = await (await fetch(params.path)).blob();
+  const bitmap = await createImageBitmap(blob);
+  const swaps = params.rotation === 90 || params.rotation === 270;
+  const rotatedWidth = swaps ? bitmap.height : bitmap.width;
+  const rotatedHeight = swaps ? bitmap.width : bitmap.height;
+  const rotated = document.createElement("canvas");
+  rotated.width = rotatedWidth;
+  rotated.height = rotatedHeight;
+  const rotatedContext = rotated.getContext("2d");
+  if (!rotatedContext) {
+    bitmap.close();
+    throw new Error("The browser could not prepare the image");
+  }
+  rotatedContext.translate(rotatedWidth / 2, rotatedHeight / 2);
+  rotatedContext.rotate((params.rotation * Math.PI) / 180);
+  rotatedContext.drawImage(bitmap, -bitmap.width / 2, -bitmap.height / 2);
+  bitmap.close();
+
+  const cropped = document.createElement("canvas");
+  cropped.width = params.cropWidth;
+  cropped.height = params.cropHeight;
+  const croppedContext = cropped.getContext("2d");
+  if (!croppedContext) throw new Error("The browser could not prepare the image");
+  croppedContext.drawImage(
+    rotated,
+    params.cropX,
+    params.cropY,
+    params.cropWidth,
+    params.cropHeight,
+    0,
+    0,
+    params.cropWidth,
+    params.cropHeight,
+  );
+  const edited = await new Promise<Blob | null>((resolve) =>
+    cropped.toBlob(resolve, "image/jpeg", 0.92),
+  );
+  if (!edited) throw new Error("The browser could not encode the edited image");
+  const path = stageBrowserFile(new File([edited], "edited.jpg", { type: "image/jpeg" }));
+  return {
+    path,
+    fileName: "edited.jpg",
+    mimeType: "image/jpeg",
+    size: edited.size,
+    width: params.cropWidth,
+    height: params.cropHeight,
+  };
 }
 
 /** Open a normal browser file input and retain enough metadata for mock sends. */
@@ -144,6 +256,7 @@ class BrowserMockBridge implements BridgeApi {
   private liveIndex = 0;
   private messageSequence = 0;
   private eventSequence = 0;
+  private offlineSimulated = false;
 
   constructor() {
     const fixture = buildFixture();
@@ -444,6 +557,156 @@ class BrowserMockBridge implements BridgeApi {
     return messageResponse(message);
   }
 
+  async deleteMessage(chatId: string, messageId: string, _deleteForEveryone: boolean) {
+    const message = this.requireMessage(chatId, messageId);
+    if (message.revoked) {
+      throw commandFailure("delete_not_allowed", "This message can no longer be deleted");
+    }
+    if (_deleteForEveryone && !message.fromMe) {
+      throw commandFailure("delete_not_allowed", "Only your own messages can be deleted for everyone");
+    }
+    message.revoked = true;
+    message.content = null;
+    this.touchChat(chatId, message, false);
+    void this.emit({ type: "messageUpserted", payload: { message: copy(message) } });
+    return messageResponse(message);
+  }
+
+  async listStatuses() {
+    const sources: Array<{ senderId: string; senderName: string; senderPhoneNumber: string; messages: Message[] }> = [
+      { senderId: "maya@s.whatsapp.net", senderName: "Maya Nair", senderPhoneNumber: "5493811000001", messages: mayaMessages() },
+      { senderId: "priya@s.whatsapp.net", senderName: "Priya Nair", senderPhoneNumber: "5493811000002", messages: priyaMessages() },
+    ];
+    const groups = sources.map(({ senderId, senderName, senderPhoneNumber, messages }) => ({
+      senderId,
+      senderName,
+      senderPhoneNumber,
+      messages: messages.slice(0, 2).map((message) => ({ ...message, senderId, senderName, senderPhoneNumber })),
+    }));
+    return { chatId: "status@broadcast", groups };
+  }
+
+  async subscribeNewsletter(inviteKey: string) {
+    return {
+      newsletter: {
+        jid: `${inviteKey.slice(0, 12) || "demo"}@newsletter`,
+        name: `Channel ${inviteKey.slice(0, 24) || "Demo"}`,
+        subscribedAtMs: Date.now(),
+        muted: false,
+      },
+    };
+  }
+
+  async listNewsletters() {
+    return {
+      newsletters: [
+        { jid: "news@newsletter", name: "Whatfast News", subscribedAtMs: Date.now() - 86_400_000, muted: false },
+        { jid: "dev@newsletter", name: "Whatfast Dev", subscribedAtMs: Date.now() - 172_800_000, muted: false },
+      ],
+    };
+  }
+
+  async listNewsletterMessages(jid: string, limit = 25) {
+    const messages = Array.from({ length: Math.min(limit, 8) }, (_, index) =>
+      makeMessage({
+        id: `${jid}-post-${index}`,
+        chatId: jid,
+        timestampMs: Date.now() - index * 3_600_000,
+        fromMe: false,
+        senderId: jid,
+        senderName: jid.startsWith("news") ? "Whatfast News" : "Whatfast Dev",
+        status: MessageStatus.Delivered,
+        content: { text: textContent(`Channel post ${index + 1}: staying up to date with the Whatfast project.`) },
+      }),
+    );
+    return { messages };
+  }
+
+  async unsubscribeNewsletter(_jid: string) {
+    return {};
+  }
+
+  async setChatPin(chatId: string, pinned: boolean) {
+    const chat = this.requireChat(chatId);
+    chat.pinned = pinned;
+    void this.emit({ type: "chatUpserted", payload: { chat: copy(chat) } });
+    return { chat: copy(chat) };
+  }
+
+  async archiveChat(chatId: string) {
+    requireMockChatId(chatId);
+    const chat = this.requireChat(chatId);
+    chat.archived = true;
+    void this.emit({ type: "chatUpserted", payload: { chat: copy(chat) } });
+    return { chat: copy(chat) };
+  }
+
+  async unarchiveChat(chatId: string) {
+    requireMockChatId(chatId);
+    const chat = this.requireChat(chatId);
+    chat.archived = false;
+    void this.emit({ type: "chatUpserted", payload: { chat: copy(chat) } });
+    return { chat: copy(chat) };
+  }
+
+  async muteChat(chatId: string, durationMs: number | null = null) {
+    requireMockChatId(chatId);
+    if (durationMs !== null && durationMs !== undefined) {
+      if (typeof durationMs !== "number" || Number.isNaN(durationMs) || durationMs < 0) {
+        throw commandFailure("invalid_argument", "mute durationMs must be >= 0");
+      }
+    }
+    const chat = this.requireChat(chatId);
+    chat.muted = true;
+    chat.muteUntilMs = typeof durationMs === "number" && durationMs > 0 ? Date.now() + durationMs : 0;
+    void this.emit({ type: "chatUpserted", payload: { chat: copy(chat) } });
+    return { chat: copy(chat) };
+  }
+
+  async unmuteChat(chatId: string) {
+    requireMockChatId(chatId);
+    const chat = this.requireChat(chatId);
+    chat.muted = false;
+    chat.muteUntilMs = 0;
+    void this.emit({ type: "chatUpserted", payload: { chat: copy(chat) } });
+    return { chat: copy(chat) };
+  }
+
+  async blockChat(chatId: string) {
+    requireMockChatId(chatId);
+    const chat = this.requireChat(chatId);
+    this.blockedChats.add(chatId);
+    chat.blocked = true;
+    void this.emit({ type: "chatUpserted", payload: { chat: copy(chat) } });
+    return { chat: copy(chat) };
+  }
+
+  async unblockChat(chatId: string) {
+    requireMockChatId(chatId);
+    const chat = this.requireChat(chatId);
+    this.blockedChats.delete(chatId);
+    chat.blocked = false;
+    void this.emit({ type: "chatUpserted", payload: { chat: copy(chat) } });
+    return { chat: copy(chat) };
+  }
+
+  async listStickers() {
+    return {
+      packs: STICKER_PACKS.map((pack) => ({
+        id: pack.id,
+        name: pack.name,
+        stickerIds: [...pack.stickerIds],
+        cover: mockSticker(STICKER_LABELS[pack.stickerIds[0]!] ?? "✨"),
+      })),
+    };
+  }
+
+  async sendStickerFromLibrary(chatId: string, stickerId: string) {
+    const label = STICKER_LABELS[stickerId];
+    if (!label) throw commandFailure("not_found", `Unknown mock sticker: ${stickerId}`);
+    return messageResponse(this.outgoingImage(chatId, mockSticker(label), "", "", true));
+  }
+
   async sendImage(chatId: string, imagePath: string, caption = "", replyToMessageId = "", replyToChatId = "") {
     return messageResponse(this.outgoingImage(chatId, imagePath, caption, replyToMessageId, false, replyToChatId));
   }
@@ -513,6 +776,9 @@ class BrowserMockBridge implements BridgeApi {
   }
 
   async markRead(chatId: string, _throughMessageId: string) {
+    if (this.offlineSimulated) {
+      throw commandFailure("offline", "The browser mock is offline (simulated); receipt was not persisted", true);
+    }
     const chat = this.requireChat(chatId);
     if (chat.unreadCount !== 0) {
       chat.unreadCount = 0;
@@ -826,6 +1092,9 @@ class BrowserMockBridge implements BridgeApi {
       setLiveEvents: (enabled) => {
         this.liveEvents = enabled;
       },
+      setOffline: (enabled) => {
+        this.offlineSimulated = enabled;
+      },
     };
   }
 
@@ -990,6 +1259,8 @@ function makeChat(input: Partial<Chat> & Pick<Chat, "id" | "title">): Chat {
     pinned: input.pinned ?? false, archived: input.archived ?? false,
     phoneNumber: input.phoneNumber ?? "", contactName: input.contactName ?? "",
     pushName: input.pushName ?? "", businessName: input.businessName ?? "",
+    lastMessageFromMe: input.lastMessageFromMe ?? false,
+    transportJid: input.transportJid ?? "",
   };
 }
 
@@ -1036,7 +1307,10 @@ function imageContent(caption: string, localPath: string) {
     caption, mimeType: "image/jpeg", localPath,
     width: 1280, height: 853, fileSize: 342_000,
     downloadable: !localPath, sticker: false, animated: false,
-    thumbnailPath: "", jpegThumbnail: [],
+    // A photo without a local file still has to render: the mock paints a
+    // deterministic picture so the thumbnail path is exercised end to end.
+    thumbnailPath: localPath || mockPhoto(caption || "Photo"),
+    jpegThumbnail: [],
   };
 }
 
@@ -1202,6 +1476,12 @@ function normalizedLimit(value: number, fallback: number): number {
 
 function commandFailure(code: string, message: string, retryable = false) {
   return { code, message, retryable };
+}
+
+function requireMockChatId(chatId: string): void {
+  if (typeof chatId !== "string" || chatId.trim().length === 0) {
+    throw commandFailure("invalid_argument", "chatId is required");
+  }
 }
 
 function copy<T>(value: T): T {

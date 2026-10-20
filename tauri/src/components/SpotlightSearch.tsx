@@ -227,6 +227,7 @@ export function SpotlightSearch(props: {
                           active={selected() === index()}
                           index={index()}
                           scale={preferences.uiScale}
+                          model={props.model}
                           onHover={() => setSelected(index())}
                           onActivate={() => void activate(row)}
                         />
@@ -286,29 +287,68 @@ function SpotlightResult(props: {
   active: boolean;
   index: number;
   scale: number;
+  model: AppModel;
   onHover: () => void;
   onActivate: () => void;
 }) {
+  const { state, actions } = props.model;
+
+  createEffect(() => {
+    const row = props.row;
+    if (row.type === "contact") {
+      const contact = row.result;
+      const contactJid = contact.contactJid;
+      if (contactJid && !state.participantAvatars[contactJid]) {
+        const cancel = actions.loadParticipantAvatar(contactJid, "spotlight");
+        onCleanup(cancel);
+      }
+      if (contact.chatId) {
+        actions.loadAvatar(contact.chatId);
+      }
+    } else if (row.type === "group") {
+      actions.loadAvatar(row.result.id);
+    } else if (row.type === "chat") {
+      actions.loadAvatar(row.match.chat.id);
+    }
+  });
+
   const title = () => {
-    if (props.row.type === "chat") return props.row.match.chat.title || props.row.match.chat.phoneNumber;
-    if (props.row.type === "contact") return props.row.result.displayName;
-    if (props.row.type === "group") return props.row.result.title;
-    return props.row.result.chatTitle;
+    const row = props.row;
+    if (row.type === "chat") return row.match.chat.title || row.match.chat.phoneNumber;
+    if (row.type === "contact") return row.result.displayName;
+    if (row.type === "group") return row.result.title;
+    return row.result.chatTitle;
   };
   const subtitle = () => {
-    if (props.row.type === "chat") {
-      return props.row.match.chat.lastMessagePreview || props.row.match.chat.phoneNumber || "No messages yet";
+    const row = props.row;
+    if (row.type === "chat") {
+      return row.match.chat.lastMessagePreview || row.match.chat.phoneNumber || "No messages yet";
     }
-    if (props.row.type === "contact") {
-      return props.row.result.phoneNumber || props.row.result.secondaryName || "Contact";
+    if (row.type === "contact") {
+      return row.result.phoneNumber || row.result.secondaryName || "Contact";
     }
-    if (props.row.type === "group") return props.row.result.lastMessagePreview || "Group";
-    return `${props.row.result.senderName ? `${props.row.result.senderName}: ` : ""}${props.row.result.snippet}`;
+    if (row.type === "group") return row.result.lastMessagePreview || "Group";
+    return `${row.result.senderName ? `${row.result.senderName}: ` : ""}${row.result.snippet}`;
   };
   const frequent = () => props.row.type === "chat" && (props.row.match.usage?.opens ?? 0) >= 3;
   const avatarPath = () => {
-    if (props.row.type === "chat") return props.row.match.chat.avatarPath;
-    if (props.row.type === "group") return props.row.result.avatarPath;
+    const row = props.row;
+    if (row.type === "chat") {
+      const liveChat = state.chats.find((c) => c.id === row.match.chat.id);
+      return liveChat?.avatarPath || row.match.chat.avatarPath;
+    }
+    if (row.type === "contact") {
+      const contact = row.result;
+      if (contact.chatId) {
+        const chat = state.chats.find((c) => c.id === contact.chatId);
+        if (chat?.avatarPath) return chat.avatarPath;
+      }
+      return (contact.contactJid && state.participantAvatars[contact.contactJid]) || "";
+    }
+    if (row.type === "group") {
+      const liveGroup = state.chats.find((c) => c.id === row.result.id);
+      return liveGroup?.avatarPath || row.result.avatarPath || "";
+    }
     return "";
   };
   const isGroup = () => {

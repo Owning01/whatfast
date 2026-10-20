@@ -1,6 +1,6 @@
 import { batch } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { bridge, discardStagedImage, normalizeBridgeError, openFile, openUrl, revealMediaPath } from "../lib/bridge";
+import { bridge, discardStagedImage, normalizeBridgeError, openFile, openUrl, revealMediaPath, stageOutgoingMedia } from "../lib/bridge";
 import { messageText } from "../lib/format";
 import { BoundedSet, boundWindowAround } from "../lib/performance";
 import {
@@ -35,11 +35,15 @@ import {
   type MessageSearchResult,
   type Reaction,
   type SearchResults,
+  type StagedMedia,
   type SyncStatus,
   type HistoryCoverage,
   type HistoryOverview,
   type IntegrityStatus,
+  MUTE_UNTIL_INDEFINITE,
   type PinnedMessage,
+  type StatusGroup,
+  type Newsletter,
 } from "../lib/types";
 import { pairingStartupDecision } from "./pairing";
 import { shouldApplySyncStatus, syncStatusActive } from "./sync";
@@ -92,7 +96,7 @@ import {
 export type { Pane, Switcher } from "./workspace";
 
 export type Screen = "starting" | "pairing" | "chats" | "fatal";
-export type ChatFilter = "all" | "unread" | "groups" | "archived";
+export type ChatFilter = "all" | "unread" | "favorites" | "groups" | "archived" | "channels";
 
 export interface Mention {
   displayName: string;
@@ -112,6 +116,11 @@ export interface Draft {
 export interface ForwardDialogState {
   sourceChatId: string;
   messageId: string;
+}
+
+export interface MessageSelection {
+  chatId: string;
+  messageIds: string[];
 }
 
 export type FileSendMode = "image" | "sticker" | "attachment";
@@ -159,16 +168,13 @@ export interface ConversationState {
   historyCoverage: HistoryCoverage | null;
 }
 
+import type { StickerPack } from "../lib/types";
+
 /**
- * Placeholder sticker-pack shape so composer/tray work can begin before the
- * STICKERS agent lands the real type in `lib/types.ts`. See `loadStickers`
- * for the corresponding defensive bridge call.
+ * Re-exported so sticker-tray components can keep importing the pack shape
+ * from the state module as before.
  */
-export interface StickerPack {
-  id: string;
-  name: string;
-  stickerIds: string[];
-}
+export type { StickerPack } from "../lib/types";
 
 export interface StickersState {
   packs: StickerPack[];
@@ -229,6 +235,17 @@ export interface AppState {
   attachmentFailures: Record<string, string>;
   imageViewer: ImageViewerState | null;
   forwardDialog: ForwardDialogState | null;
+  selection: MessageSelection | null;
+  statuses: StatusGroup[];
+  statusesChatId: string;
+  /** Background color per local text-status message id (memory only). */
+  statusColors: Record<string, string>;
+  /** Locally starred message ids, persisted to localStorage. */
+  starred: Record<string, boolean>;
+  newsletters: Newsletter[];
+  selectedNewsletter: Newsletter | null;
+  newsletterPosts: Message[];
+  newsletterLoading: boolean;
   fileSendConfirmation: FileSendConfirmationState | null;
   settingsOpen: boolean;
   stickers: StickersState;
@@ -267,6 +284,43 @@ function emptyConversation(chatId: string): ConversationState {
     liveMessageVersion: 0,
     historyCoverage: null,
   };
+}
+
+const FAVORITES_KEY = "whatfast-favorites";
+const STARRED_KEY = "whatfast-starred";
+
+function readStringSet(key: string): Set<string> {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return new Set();
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(parsed.filter((item): item is string => typeof item === "string"));
+  } catch {
+    return new Set();
+  }
+}
+
+function writeStringSet(key: string, ids: Set<string> | Record<string, boolean> | readonly string[]) {
+  try {
+    const list = Array.isArray(ids) ? ids : ids instanceof Set ? [...ids] : Object.keys(ids).filter((id) => (ids as Record<string, boolean>)[id]);
+    localStorage.setItem(key, JSON.stringify(list));
+  } catch {
+    // localStorage is best-effort (private mode); in-memory state still works.
+  }
+}
+
+function readStarred(): Record<string, boolean> {
+  const starred: Record<string, boolean> = {};
+  for (const id of readStringSet(STARRED_KEY)) starred[id] = true;
+  return starred;
+}
+
+/** Re-apply local-only favorites onto a chat list from any source. */
+function applyFavorites(chats: Chat[]): Chat[] {
+  const favorites = readStringSet(FAVORITES_KEY);
+  if (favorites.size === 0) return chats;
+  return chats.map((chat) => (favorites.has(chat.id) && !chat.favorite ? { ...chat, favorite: true } : chat));
 }
 
 export interface AppModelLifecycleHooks {
@@ -346,6 +400,15 @@ export function createAppModel(lifecycleHooks: AppModelLifecycleHooks = {}) {
     attachmentFailures: {},
     imageViewer: null,
     forwardDialog: null,
+    selection: null,
+    statuses: [],
+    statusesChatId: "",
+    statusColors: {},
+    starred: readStarred(),
+    newsletters: [],
+    selectedNewsletter: null,
+    newsletterPosts: [],
+    newsletterLoading: false,
     fileSendConfirmation: null,
     settingsOpen: false,
     stickers: { packs: [], loading: false, error: "" },
@@ -367,6 +430,7 @@ export function createAppModel(lifecycleHooks: AppModelLifecycleHooks = {}) {
   const chatInfoGeneration = new RequestGeneration();
   let disposed = false;
   let toastId = 0;
+  let statusRefreshTimer: number | undefined;
   const pendingImages = new Set<string>();
   const pollVoteGenerations = new Map<string, number>();
   const pinGenerations = new Map<string, number>();
@@ -458,6 +522,11 @@ export function createAppModel(lifecycleHooks: AppModelLifecycleHooks = {}) {
           console.warn("Could not initialize notifications", error);
         });
       }
+      // Statuses arrive without a push event, so poll the store periodically
+      // to keep the ring strip fresh without relying on reconnect.
+      statusRefreshTimer = window.setInterval(() => {
+        void loadStatuses();
+      }, 45_000);
       await loadChats(true);
       await restoreWorkspaceConversations();
       markBackendReady();
@@ -550,7 +619,7 @@ export function createAppModel(lifecycleHooks: AppModelLifecycleHooks = {}) {
       // Merge into the current snapshot even on a first-page refresh: a live
       // upsert or already-loaded tail page may have arrived while this request
       // was in flight.
-      const merged = mergeChats(state.chats, response.chats);
+      const merged = applyFavorites(mergeChats(state.chats, response.chats));
       batch(() => {
         setState("chats", reconcile(sortChats(merged), { key: "id" }));
         setState("totalChats", response.totalCount);
@@ -591,7 +660,7 @@ export function createAppModel(lifecycleHooks: AppModelLifecycleHooks = {}) {
           "chats",
           reconcile(
             reconcileAuthoritativeChats(
-              authoritative,
+              applyFavorites(authoritative),
               state.chats,
               revisionsBefore,
               backendChatRevisions,
@@ -1384,6 +1453,428 @@ export function createAppModel(lifecycleHooks: AppModelLifecycleHooks = {}) {
     scheduleTyping(chatId, false);
   }
 
+  async function deleteMessage(messageId: string, deleteForEveryone: boolean, chatId = state.selectedChatId) {
+    if (!chatId) return;
+    const messages = state.conversations[chatId]?.messages;
+    const index = messages?.findIndex((candidate) => candidate.id === messageId) ?? -1;
+    const message = index >= 0 ? messages?.[index] : undefined;
+    if (!message) return;
+    if (deleteForEveryone && !message.fromMe) {
+      toast("Only your own messages can be deleted for everyone");
+      return;
+    }
+    const previous = message;
+    updateMessage(chatId, messageId, (current) => ({ ...current, revoked: true, content: null }));
+    try {
+      const response = await bridge.deleteMessage(chatId, messageId, deleteForEveryone);
+      if (response.message) upsertMessage(response.message, false);
+    } catch (error) {
+      updateMessage(chatId, messageId, () => previous);
+      toast(normalizeBridgeError(error).message);
+    }
+  }
+
+  function toggleMessageSelection(messageId: string, chatId = state.selectedChatId) {
+    if (!chatId) return;
+    const current = state.selection;
+    if (current && current.chatId !== chatId) {
+      setState("selection", { chatId, messageIds: [messageId] });
+      return;
+    }
+    const selected = current?.messageIds.includes(messageId) ?? false;
+    if (selected) {
+      const remaining = current!.messageIds.filter((id) => id !== messageId);
+      setState("selection", remaining.length > 0 ? { chatId, messageIds: remaining } : null);
+    } else {
+      setState("selection", { chatId, messageIds: [...(current?.messageIds ?? []), messageId] });
+    }
+  }
+
+  function enterMessageSelection(chatId: string) {
+    if (state.selection) return;
+    setState("selection", { chatId, messageIds: [] });
+  }
+
+  function clearMessageSelection() {
+    setState("selection", null);
+  }
+
+  async function loadStatuses() {
+    try {
+      const response = await bridge.listStatuses();
+      batch(() => {
+        setState("statuses", response.groups);
+        setState("statusesChatId", response.chatId);
+      });
+    } catch (error) {
+      // Statuses are best-effort; the strip simply stays empty on failure.
+      console.error("Could not load statuses", error);
+    }
+  }
+
+  function markStatusesRead() {
+    if (state.statusesChatId) void markChatRead(state.statusesChatId);
+    // Keep the rings visible so statuses stay reachable; the viewer just
+    // acknowledges them on the backend.
+  }
+
+  function publishStatus(path: string, mode: FileSendMode, attachmentKind: AttachmentKind, voiceNote = false) {
+    if (!state.statusesChatId || !path) return;
+    // The picked file belongs to the user: it is staged by the core and the
+    // staged copy is discarded after the send. The original is never touched.
+    void requestFileSend([path], mode, attachmentKind, voiceNote, state.statusesChatId);
+  }
+
+  async function loadNewsletters() {
+    try {
+      const response = await bridge.listNewsletters();
+      setState("newsletters", response.newsletters);
+      const selected = state.selectedNewsletter;
+      if (selected) {
+        const refreshed = response.newsletters.find((item) => item.jid === selected.jid);
+        setState("selectedNewsletter", refreshed ?? null);
+      }
+    } catch {
+      // Best-effort; the channels tab simply stays empty on failure.
+    }
+  }
+
+  async function selectNewsletter(jid: string) {
+    const newsletter = state.newsletters.find((item) => item.jid === jid);
+    if (!newsletter) return;
+    setState("selectedNewsletter", newsletter);
+    setState("newsletterPosts", []);
+    setState("newsletterLoading", true);
+    try {
+      const response = await bridge.listNewsletterMessages(jid, 25);
+      setState("newsletterPosts", response.messages);
+    } catch (error) {
+      notifyError(error);
+    } finally {
+      setState("newsletterLoading", false);
+    }
+  }
+
+  function closeNewsletter() {
+    setState("selectedNewsletter", null);
+    setState("newsletterPosts", []);
+  }
+
+  async function subscribeNewsletter(inviteKey: string) {
+    if (!inviteKey.trim()) return;
+    try {
+      const response = await bridge.subscribeNewsletter(inviteKey.trim());
+      if (!response.newsletter) return;
+      setState("newsletters", (items) => [...items.filter((item) => item.jid !== response.newsletter!.jid), response.newsletter!]);
+      await selectNewsletter(response.newsletter.jid);
+    } catch (error) {
+      notifyError(error);
+    }
+  }
+
+  async function unsubscribeNewsletter(jid: string) {
+    try {
+      await bridge.unsubscribeNewsletter(jid);
+      setState("newsletters", (items) => items.filter((item) => item.jid !== jid));
+      if (state.selectedNewsletter?.jid === jid) closeNewsletter();
+    } catch (error) {
+      notifyError(error);
+    }
+  }
+
+  async function setChatPinned(chatId: string, pinned: boolean) {
+    const chat = state.chats.find((candidate) => candidate.id === chatId);
+    if (!chat) return;
+    const previous = chat.pinned;
+    const optimistic = reconcile(
+      sortChats(state.chats.map((item) => (item.id === chatId ? { ...item, pinned } : item))),
+      { key: "id" },
+    );
+    setState("chats", optimistic);
+    try {
+      const response = await bridge.setChatPin(chatId, pinned);
+      if (response.chat) upsertChat(response.chat);
+    } catch (error) {
+      const rollback = reconcile(
+        sortChats(state.chats.map((item) => (item.id === chatId ? { ...item, pinned: previous } : item))),
+        { key: "id" },
+      );
+      setState("chats", rollback);
+      notifyError(error);
+    }
+  }
+
+  /** Optimistic archive flag with rollback on failure (same pattern as setChatPinned). */
+  async function setChatArchived(chatId: string, archived: boolean) {
+    const chat = state.chats.find((candidate) => candidate.id === chatId);
+    if (!chat) return;
+    const previous = chat.archived;
+    setState("chats", (candidate) => candidate.id === chatId, "archived", archived);
+    try {
+      const response = archived ? await bridge.archiveChat(chatId) : await bridge.unarchiveChat(chatId);
+      if (response.chat) upsertChat(response.chat);
+    } catch (error) {
+      setState("chats", (candidate) => candidate.id === chatId, "archived", previous);
+      notifyError(error);
+    }
+  }
+
+  /** Optimistic mute flag with optional expiry and rollback on failure. Null means muted indefinitely. */
+  async function setChatMuted(chatId: string, muted: boolean, durationMs: number | null = null) {
+    const chat = state.chats.find((candidate) => candidate.id === chatId);
+    if (!chat) return;
+    const previousMuted = chat.muted;
+    const previousMuteUntilMs = chat.muteUntilMs ?? 0;
+    const muteUntilMs = muted
+      ? typeof durationMs === "number" && durationMs > 0
+        ? Date.now() + durationMs
+        : MUTE_UNTIL_INDEFINITE
+      : 0;
+    batch(() => {
+      setState("chats", (candidate) => candidate.id === chatId, "muted", muted);
+      setState("chats", (candidate) => candidate.id === chatId, "muteUntilMs", muteUntilMs);
+    });
+    try {
+      const response = muted ? await bridge.muteChat(chatId, durationMs) : await bridge.unmuteChat(chatId);
+      if (response.chat) upsertChat(response.chat);
+    } catch (error) {
+      batch(() => {
+        setState("chats", (candidate) => candidate.id === chatId, "muted", previousMuted);
+        setState("chats", (candidate) => candidate.id === chatId, "muteUntilMs", previousMuteUntilMs);
+      });
+      notifyError(error);
+    }
+  }
+
+  /** Optimistic block flag with rollback on failure (same pattern as setChatPinned). */
+  async function setChatBlocked(chatId: string, blocked: boolean) {
+    const chat = state.chats.find((candidate) => candidate.id === chatId);
+    if (!chat) return;
+    const previous = chat.blocked ?? false;
+    setState("chats", (candidate) => candidate.id === chatId, "blocked", blocked);
+    try {
+      const response = blocked ? await bridge.blockChat(chatId) : await bridge.unblockChat(chatId);
+      if (response.chat) upsertChat(response.chat);
+    } catch (error) {
+      setState("chats", (candidate) => candidate.id === chatId, "blocked", previous);
+      notifyError(error);
+    }
+  }
+
+  function toggleFavorite(chatId: string) {
+    const chat = state.chats.find((candidate) => candidate.id === chatId);
+    if (!chat) return;
+    const next = !chat.favorite;
+    setState("chats", (candidate) => candidate.id === chatId, "favorite", next);
+    const favorites = readStringSet(FAVORITES_KEY);
+    if (next) favorites.add(chatId);
+    else favorites.delete(chatId);
+    writeStringSet(FAVORITES_KEY, favorites);
+  }
+
+  function toggleStar(messageId: string) {
+    if (typeof messageId !== "string" || messageId.trim().length === 0) return;
+    const next = !state.starred[messageId];
+    if (next) setState("starred", messageId, true);
+    else setState("starred", messageId, undefined!);
+    writeStringSet(STARRED_KEY, state.starred);
+  }
+
+  function isStarred(messageId: string): boolean {
+    return Boolean(state.starred[messageId]);
+  }
+
+  /** Linked-device scope cannot change this server-side; keep it informational. */
+  function setDisappearingTimer(chatId: string, seconds: number) {
+    if (state.chatInfo?.chat?.id === chatId) {
+      setState("chatInfo", "disappearingTimerSeconds", seconds);
+    }
+    toast("Disappearing timer is read-only on a linked device", "info");
+  }
+
+  /** Local-only group management: linked-device scope has no group RPC. */
+  async function createGroup(name: string, participantChatIds: string[] = []) {
+    const title = (name ?? "").trim() || "New group";
+    const randomPart =
+      typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+        ? crypto.randomUUID()
+        : `${Date.now()}`;
+    const id = `chat-local-group-${randomPart}`;
+    const chat: Chat = {
+      id,
+      kind: ChatKind.Group,
+      title,
+      avatarPath: "",
+      lastMessagePreview: "Group created locally",
+      lastMessageTimestampMs: Date.now(),
+      unreadCount: 0,
+      muted: false,
+      pinned: false,
+      archived: false,
+      phoneNumber: "",
+      contactName: "",
+      pushName: "",
+      businessName: "",
+      lastMessageFromMe: false,
+      transportJid: `${id}@g.us`,
+    };
+    void participantChatIds;
+    setState("chats", reconcile(sortChats([...state.chats, chat]), { key: "id" }));
+    setState("conversations", id, {
+      chatId: id,
+      messages: [],
+      loading: false,
+      loadingOlder: false,
+      loadingNewer: false,
+      hasOlder: false,
+      hasNewer: false,
+      firstUnreadMessageId: "",
+      highlightedMessageId: "",
+      liveMessageVersion: 0,
+      historyCoverage: null,
+    });
+    toast("Group management is limited on a linked device: group created locally", "info");
+    await selectChat(id);
+  }
+
+  async function leaveGroup(chatId: string) {
+    const chat = state.chats.find((candidate) => candidate.id === chatId);
+    if (!chat) return;
+    setState("chats", (candidate) => candidate.id === chatId, "archived", true);
+    toast("Group management is limited on a linked device: left locally (archived)", "info");
+  }
+
+  async function addParticipant(chatId: string, contactJid: string) {
+    if (state.chatInfo?.chat?.id === chatId && contactJid.trim()) {
+      const jid = contactJid.trim();
+      const exists = state.chatInfo.participants.some((participant) => participant.participantId === jid);
+      if (!exists) {
+        setState("chatInfo", "participants", (participants) => [
+          ...participants,
+          {
+            participantId: jid,
+            displayName: jid.split("@")[0] ?? jid,
+            phoneNumber: "",
+            isAdmin: false,
+            isSuperAdmin: false,
+            isMe: false,
+          },
+        ]);
+        setState("chatInfo", "participantCount", (count) => count + 1);
+      }
+    }
+    toast("Group management is limited on a linked device: participant added locally", "info");
+  }
+
+  /** Text status kept in memory; reuses the existing viewer + markStatusesRead. */
+  function publishTextStatus(text: string, backgroundColor: string) {
+    const trimmed = (text ?? "").trim();
+    if (!trimmed) {
+      toast("Status text cannot be empty");
+      return;
+    }
+    const MAX_STATUS_LENGTH = 700;
+    const capped = trimmed.length > MAX_STATUS_LENGTH ? trimmed.slice(0, MAX_STATUS_LENGTH) : trimmed;
+    if (capped.length < trimmed.length) {
+      toast("Status text truncated to 700 characters", "info");
+    }
+    const id = `local-status-${Date.now()}`;
+    const message: Message = {
+      id,
+      chatId: state.statusesChatId || "status@broadcast",
+      senderId: state.ownUserId || "me@s.whatsapp.net",
+      senderName: "You",
+      fromMe: true,
+      timestampMs: Date.now(),
+      status: 2,
+      edited: false,
+      revoked: false,
+      expiresAtMs: 0,
+      senderPhoneNumber: "",
+      senderAvatarPath: "",
+      reactions: [],
+      replyToMessageId: "",
+      replyToChatId: "",
+      forwardingScore: 0,
+      mentionTexts: [],
+      content: { text: { text: capped, linkPreview: null } },
+    };
+    setState("statusColors", id, backgroundColor);
+    const ownIndex = state.statuses.findIndex((group) => group.senderId === message.senderId);
+    if (ownIndex >= 0) {
+      setState("statuses", ownIndex, "messages", (messages) => [...messages, message]);
+    } else {
+      setState("statuses", (groups) => [
+        {
+          senderId: message.senderId,
+          senderName: "You",
+          senderPhoneNumber: "",
+          messages: [message],
+        },
+        ...groups,
+      ]);
+    }
+    toast("Text status published locally", "info");
+  }
+
+  /** Local-only channel creation for the browser mock (badge "local"). */
+  function createLocalChannel(name: string, description = "") {
+    const title = name.trim();
+    if (!title) {
+      toast("Channel name cannot be empty");
+      return;
+    }
+    const jid = `local-${Date.now()}@newsletter`;
+    const newsletter: Newsletter = {
+      jid,
+      name: title,
+      subscribedAtMs: Date.now(),
+      muted: false,
+      local: true,
+      description,
+    };
+    setState("newsletters", (items) => [...items, newsletter]);
+    toast("Channel created locally (linked-device scope has no channel RPC)", "info");
+  }
+
+  function toggleNewsletterMute(jid: string) {
+    const newsletter = state.newsletters.find((item) => item.jid === jid);
+    if (!newsletter) return;
+    setState("newsletters", (item) => item.jid === jid, "muted", !newsletter.muted);
+  }
+
+  function callsUnsupported() {
+    toast("Calls not supported (WA-03/WA-04): whatsmeow has no VoIP; scope exception", "info");
+  }
+
+  async function deleteSelection(deleteForEveryone: boolean, chatId = state.selectedChatId) {
+    const selection = state.selection;
+    if (!selection || selection.chatId !== chatId || selection.messageIds.length === 0) return;
+    const ids = [...selection.messageIds];
+    const previous = new Map<string, Message>();
+    for (const messageId of ids) {
+      const messages = state.conversations[chatId]?.messages;
+      const message = messages?.find((candidate) => candidate.id === messageId);
+      if (!message) continue;
+      if (deleteForEveryone && !message.fromMe) continue;
+      previous.set(messageId, message);
+      updateMessage(chatId, messageId, (current) => ({ ...current, revoked: true, content: null }));
+    }
+    setState("selection", null);
+    const failures: string[] = [];
+    for (const messageId of ids) {
+      try {
+        const response = await bridge.deleteMessage(chatId, messageId, deleteForEveryone);
+        if (response.message) upsertMessage(response.message, false);
+      } catch (error) {
+        const rollback = previous.get(messageId);
+        if (rollback) updateMessage(chatId, messageId, () => rollback);
+        failures.push(normalizeBridgeError(error).message);
+      }
+    }
+    if (failures.length > 0) toast(`Some messages could not be deleted: ${failures[0]}`);
+  }
+
   function startForward(messageId: string, sourceChatId = state.selectedChatId) {
     if (!sourceChatId) return;
     setState("forwardDialog", { sourceChatId, messageId });
@@ -1539,19 +2030,42 @@ export function createAppModel(lifecycleHooks: AppModelLifecycleHooks = {}) {
     await enqueueFileSend(chatId, path, "attachment", kind, voiceNote);
   }
 
-  function requestFileSend(
+  /**
+   * Prepare a batch of files for sending.
+   *
+   * Unless the caller already staged the file (the clipboard paste and the
+   * recorded voice note live in their own caches), every picked file is
+   * handed to the desktop core first, which inspects it and copies it into
+   * the profile staging area. The backend only ever reads staged files.
+   */
+  async function requestFileSend(
     paths: string[],
     mode: FileSendMode,
     attachmentKind: AttachmentKind = AttachmentKind.Document,
     voiceNote = false,
     chatId = state.selectedChatId,
     temporaryPaths: string[] = [],
-  ): boolean {
+    alreadyStaged = false,
+  ): Promise<boolean> {
     const selectedPaths = paths.filter(Boolean);
     if (!chatId || selectedPaths.length === 0 || state.sending || state.fileSendConfirmation) return false;
+    let stagedPaths = selectedPaths;
+    if (!alreadyStaged) {
+      const kind = mode === "image" ? "image" : mode === "sticker" ? "sticker" : "attachment";
+      try {
+        const staged: StagedMedia[] = [];
+        for (const path of selectedPaths) {
+          staged.push(await stageOutgoingMedia(path, kind));
+        }
+        stagedPaths = staged.map((media) => media.path);
+      } catch (error) {
+        notifyError(error);
+        return false;
+      }
+    }
     setState("fileSendConfirmation", {
       chatId,
-      paths: selectedPaths,
+      paths: stagedPaths,
       mode,
       attachmentKind,
       voiceNote,
@@ -1561,9 +2075,11 @@ export function createAppModel(lifecycleHooks: AppModelLifecycleHooks = {}) {
   }
 
   function cancelFileSend() {
-    const temporaryPaths = [...(state.fileSendConfirmation?.temporaryPaths ?? [])];
+    const request = state.fileSendConfirmation;
+    const temporaryPaths = [...(request?.temporaryPaths ?? [])];
     setState("fileSendConfirmation", null);
     discardTemporaryFiles(temporaryPaths);
+    discardTemporaryFiles(request?.paths ?? []);
   }
 
   async function confirmFileSend() {
@@ -1674,7 +2190,7 @@ export function createAppModel(lifecycleHooks: AppModelLifecycleHooks = {}) {
       }
     } finally {
       setState("sending", false);
-      discardTemporaryFiles(temporaryPaths);
+      discardTemporaryFiles([...new Set([...temporaryPaths, ...paths])]);
     }
   }
 
@@ -1815,17 +2331,19 @@ export function createAppModel(lifecycleHooks: AppModelLifecycleHooks = {}) {
     }
   }
 
-  async function loadAvatar(chatId: string) {
-    const chat = state.chats.find((candidate) => candidate.id === chatId);
-    if (
-      !chat ||
-      chat.avatarPath ||
-      pendingAvatars.has(chatId) ||
-      attemptedAvatars.has(chatId) ||
-      pendingAvatars.size >= 4
-    ) return;
+  const chatAvatarQueue: string[] = [];
+  const MAX_CONCURRENT_CHAT_AVATARS = 4;
+
+  function processChatAvatarQueue() {
+    while (pendingAvatars.size < MAX_CONCURRENT_CHAT_AVATARS && chatAvatarQueue.length > 0) {
+      const nextChatId = chatAvatarQueue.shift();
+      if (!nextChatId) break;
+      void fetchChatAvatar(nextChatId);
+    }
+  }
+
+  async function fetchChatAvatar(chatId: string) {
     pendingAvatars.add(chatId);
-    attemptedAvatars.add(chatId);
     try {
       const response = await bridge.getChatAvatar(chatId);
       if (response.avatarPath) {
@@ -1835,7 +2353,16 @@ export function createAppModel(lifecycleHooks: AppModelLifecycleHooks = {}) {
       // Avatar privacy/availability failures do not interrupt messaging.
     } finally {
       pendingAvatars.delete(chatId);
+      processChatAvatarQueue();
     }
+  }
+
+  function loadAvatar(chatId: string) {
+    const chat = state.chats.find((candidate) => candidate.id === chatId);
+    if (!chat || chat.avatarPath || pendingAvatars.has(chatId) || attemptedAvatars.has(chatId)) return;
+    attemptedAvatars.add(chatId);
+    chatAvatarQueue.push(chatId);
+    processChatAvatarQueue();
   }
 
   function loadParticipantAvatar(participantId: string, rosterId: string) {
@@ -1943,25 +2470,13 @@ export function createAppModel(lifecycleHooks: AppModelLifecycleHooks = {}) {
   }
 
   // ---------------------------------------------------------------------
-  // Stickers (placeholder pending the STICKERS agent's bridge/type work)
+  // Stickers
   // ---------------------------------------------------------------------
 
-  /**
-   * `bridge` does not yet declare `listStickers`; the STICKERS agent is
-   * adding it (and the real `StickerPack` type) to `lib/bridge.ts` and
-   * `lib/types.ts`. Call it defensively so this compiles and degrades to a
-   * reported error in the meantime.
-   */
   async function loadStickers() {
-    const listStickers = (bridge as Partial<{ listStickers: () => Promise<{ packs: StickerPack[] }> }>)
-      .listStickers;
-    if (!listStickers) {
-      setState("stickers", "error", "Sticker sync is not available in this build yet");
-      return;
-    }
     setState("stickers", "loading", true);
     try {
-      const response = await listStickers();
+      const response = await bridge.listStickers();
       batch(() => {
         setState("stickers", "packs", response.packs);
         setState("stickers", "error", "");
@@ -1974,19 +2489,11 @@ export function createAppModel(lifecycleHooks: AppModelLifecycleHooks = {}) {
   }
 
   async function sendStickerFromPack(stickerId: string, chatId = state.selectedChatId) {
-    const sendStickerById = (
-      bridge as Partial<{
-        sendStickerById: (chatId: string, stickerId: string) => Promise<{ message: Message | null }>;
-      }>
-    ).sendStickerById;
     if (!chatId) return;
-    if (!sendStickerById) {
-      toast("Sticker sync is not available in this build yet");
-      return;
-    }
     try {
-      const response = await sendStickerById(chatId, stickerId);
+      const response = await bridge.sendStickerFromLibrary(chatId, stickerId);
       if (response.message) upsertMessage(response.message, true);
+      else toast("Sticker library is not available in this build yet");
     } catch (error) {
       toast(normalizeBridgeError(error).message);
     }
@@ -2071,6 +2578,10 @@ export function createAppModel(lifecycleHooks: AppModelLifecycleHooks = {}) {
     historyResultWaiters.clear();
     disposeNotificationActions?.();
     disposeNotificationActions = undefined;
+    if (statusRefreshTimer !== undefined) {
+      window.clearInterval(statusRefreshTimer);
+      statusRefreshTimer = undefined;
+    }
     participantAvatarQueue.clear();
   }
 
@@ -2130,6 +2641,7 @@ export function createAppModel(lifecycleHooks: AppModelLifecycleHooks = {}) {
         });
         if (event.payload.state === ConnectionState.Connected) {
           void loadHistoryOverview();
+          void loadStatuses();
           void loadChats(true).then(async () => {
             await restoreWorkspaceConversations();
             markBackendReady();
@@ -2283,7 +2795,25 @@ export function createAppModel(lifecycleHooks: AppModelLifecycleHooks = {}) {
   }
 
   function upsertChat(chat: Chat) {
-    setState("chats", reconcile(sortChats(mergeChats(state.chats, [chat])), { key: "id" }));
+    // Status updates and channel subscriptions live in their own surfaces
+    // (status rings / the channels tab) and must never become chat rows.
+    if (isHiddenConversation(chat)) return;
+    const existing = state.chats.find((candidate) => candidate.id === chat.id);
+    // Preserve locally-known flags when an incoming upsert does not carry
+    // them (undefined): a partial event must never clear an optimistic or
+    // previously-loaded archived/muted/favorite/pinned/blocked/muteUntilMs.
+    let merged: Chat = chat;
+    if (existing) {
+      merged = { ...merged };
+      if ((merged.archived as boolean | undefined) === undefined) merged.archived = existing.archived;
+      if ((merged.muted as boolean | undefined) === undefined) merged.muted = existing.muted;
+      if ((merged.pinned as boolean | undefined) === undefined) merged.pinned = existing.pinned;
+      if (merged.favorite === undefined) merged.favorite = existing.favorite;
+      if (merged.blocked === undefined) merged.blocked = existing.blocked;
+      if (merged.muteUntilMs === undefined) merged.muteUntilMs = existing.muteUntilMs;
+      if (existing.favorite && !merged.favorite) merged.favorite = true;
+    }
+    setState("chats", reconcile(sortChats(mergeChats(state.chats, [merged])), { key: "id" }));
   }
 
   async function notifyForMessage(message: Message, chat: Chat) {
@@ -2640,6 +3170,11 @@ export function createAppModel(lifecycleHooks: AppModelLifecycleHooks = {}) {
     }
   }
 
+  function markChatUnread(chatId: string) {
+    if (!chatId) return;
+    setState("chats", (chat) => chat.id === chatId, "unreadCount", (count) => Math.max(1, count + 1));
+  }
+
   function ensureDraft(chatId: string) {
     if (!state.drafts[chatId]) setState("drafts", chatId, emptyDraft());
   }
@@ -2666,17 +3201,31 @@ export function createAppModel(lifecycleHooks: AppModelLifecycleHooks = {}) {
   }
 
   function filteredChats(): Chat[] {
-    return state.chats.filter((chat) => {
+    const list = state.chats.filter((chat) => {
+      if (isHiddenConversation(chat)) return false;
       if (state.chatFilter === "archived") return chat.archived;
       if (chat.archived) return false;
       if (state.chatFilter === "unread") return chat.unreadCount > 0;
+      if (state.chatFilter === "favorites") return Boolean(chat.favorite);
       if (state.chatFilter === "groups") return chat.kind === ChatKind.Group;
+      if (state.chatFilter === "channels") return false;
       return true;
     });
+
+    return list.slice().sort((left, right) =>
+      Number(right.pinned) - Number(left.pinned) ||
+      right.lastMessageTimestampMs - left.lastMessageTimestampMs ||
+      left.id.localeCompare(right.id)
+    );
   }
 
   function selectedChat(): Chat | undefined {
     return state.chats.find((chat) => chat.id === state.selectedChatId);
+  }
+
+  function isHiddenConversation(chat: Chat): boolean {
+    const transport = chat.transportJid;
+    return transport === "status@broadcast" || transport.endsWith("@newsletter");
   }
 
   function activeDraft(chatId = state.selectedChatId): Draft {
@@ -2725,9 +3274,39 @@ export function createAppModel(lifecycleHooks: AppModelLifecycleHooks = {}) {
       replyTo,
       replyPrivately,
       cancelReply,
-      editMessage,
-      cancelEdit,
-      startForward,
+    editMessage,
+    cancelEdit,
+    deleteMessage,
+    toggleMessageSelection,
+    enterMessageSelection,
+    clearMessageSelection,
+    deleteSelection,
+    loadStatuses,
+    markStatusesRead,
+    markChatRead,
+    markChatUnread,
+    publishStatus,
+    publishTextStatus,
+    loadNewsletters,
+    selectNewsletter,
+    closeNewsletter,
+    subscribeNewsletter,
+    unsubscribeNewsletter,
+    createLocalChannel,
+    toggleNewsletterMute,
+    setChatPinned,
+    setChatArchived,
+    setChatMuted,
+    setChatBlocked,
+    toggleFavorite,
+    toggleStar,
+    isStarred,
+    setDisappearingTimer,
+    createGroup,
+    leaveGroup,
+    addParticipant,
+    callsUnsupported,
+    startForward,
       cancelForward,
       forwardMessage,
       addMention,

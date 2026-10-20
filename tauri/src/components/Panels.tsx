@@ -1,4 +1,4 @@
-import { createSignal, For, onMount, Show } from "solid-js";
+import { createMemo, createSignal, For, onMount, Show } from "solid-js";
 import type { JSX } from "solid-js";
 import {
   Archive,
@@ -17,15 +17,17 @@ import {
   MessagesSquare,
   Palette,
   Pencil,
+  Pin,
   Plus,
   ShieldCheck,
+  Star,
   Trash2,
   UsersRound,
   X,
 } from "lucide-solid";
 import type { AppModel } from "../state/app";
 import { ChatKind } from "../lib/types";
-import { formatDay } from "../lib/format";
+import { formatDay, formatTime, messageText } from "../lib/format";
 import {
   listDesktopApplications,
   normalizeBridgeError,
@@ -33,6 +35,7 @@ import {
   type DesktopApplications,
 } from "../lib/bridge";
 import { exportTheme, THEME_TOKENS, type Theme, type ThemeToken } from "../lib/theme";
+import { t } from "../lib/i18n";
 import { Avatar } from "./Avatar";
 import { ParticipantList } from "./ParticipantList";
 import { EmptyState, IconButton, Spinner } from "./Primitives";
@@ -42,6 +45,12 @@ export function ChatInfoPanel(props: { model: AppModel }) {
   const { state, actions, preferences } = props.model;
   const chat = () => actions.selectedChat();
   const info = () => state.chatInfo;
+  const starredInChat = createMemo(() => {
+    const selectedId = props.model.state.selectedChatId;
+    const conversation = props.model.state.conversations[selectedId];
+    if (!conversation) return [];
+    return conversation.messages.filter((m) => props.model.state.starred[m.id]);
+  });
 
   return (
     <aside class="right-panel" aria-label="Chat information">
@@ -51,12 +60,23 @@ export function ChatInfoPanel(props: { model: AppModel }) {
       </header>
       <div class="right-panel-scroll">
         <div class="profile-hero">
-          <Avatar
-            name={chat()?.title || chat()?.phoneNumber || "Chat"}
-            path={chat()?.avatarPath}
-            size={116 * preferences.uiScale}
-            group={chat()?.kind === ChatKind.Group}
-          />
+          <button
+            type="button"
+            class="profile-avatar-button"
+            title="View photo"
+            aria-label="View photo"
+            onClick={() => {
+              const p = chat()?.avatarPath;
+              if (p) actions.openImage(p, chat()?.title || "Profile picture", false);
+            }}
+          >
+            <Avatar
+              name={chat()?.title || chat()?.phoneNumber || "Chat"}
+              path={chat()?.avatarPath}
+              size={116 * preferences.uiScale}
+              group={chat()?.kind === ChatKind.Group}
+            />
+          </button>
           <h2>{chat()?.title || chat()?.phoneNumber}</h2>
           <p>{chat()?.kind === ChatKind.Group ? `${info()?.participantCount || ""} participants` : chat()?.phoneNumber}</p>
         </div>
@@ -103,6 +123,15 @@ export function ChatInfoPanel(props: { model: AppModel }) {
                   <Show when={value().disappearingTimerSeconds > 0}>
                     <div class="info-row"><Clock3 size={18} /><span>Disappearing messages: {formatTimer(value().disappearingTimerSeconds)}</span></div>
                   </Show>
+                  <div class="info-row">
+                    <Clock3 size={18} />
+                    <span>Disappearing timer (read-only on linked device)</span>
+                  </div>
+                  <div class="path-row">
+                    <button type="button" class="secondary-button" onClick={() => actions.setDisappearingTimer(chat()?.id ?? "", 0)}>Off</button>
+                    <button type="button" class="secondary-button" onClick={() => actions.setDisappearingTimer(chat()?.id ?? "", 86_400)}>24h</button>
+                    <button type="button" class="secondary-button" onClick={() => actions.setDisappearingTimer(chat()?.id ?? "", 604_800)}>7d</button>
+                  </div>
                   <Show when={value().announceOnly}>
                     <div class="info-row"><LockKeyhole size={18} /><span>Only admins can send messages</span></div>
                   </Show>
@@ -143,12 +172,100 @@ export function ChatInfoPanel(props: { model: AppModel }) {
                   )}
                 </Show>
               </section>
+ 
+              <section class="info-section">
+                <h3>Starred messages ({starredInChat().length})</h3>
+                <Show
+                  when={starredInChat().length > 0}
+                  fallback={<p style={{ color: "var(--fg-subtle)", "font-size": "13px" }}>No starred messages in this chat.</p>}
+                >
+                  <div class="starred-message-list">
+                    <For each={starredInChat()}>
+                      {(msg) => (
+                        <button
+                          type="button"
+                          class="starred-message-item"
+                          onClick={() => {
+                            actions.hideChatInfo();
+                            void actions.selectChat(props.model.state.selectedChatId, msg.id);
+                          }}
+                        >
+                          <div class="starred-item-top">
+                            <strong>{msg.fromMe ? "You" : msg.senderName || "Sender"}</strong>
+                            <small>{formatTime(msg.timestampMs)}</small>
+                          </div>
+                          <span>{messageText(msg) || "Attachment"}</span>
+                        </button>
+                      )}
+                    </For>
+                  </div>
+                </Show>
+              </section>
 
               <section class="info-section">
                 <Show when={chat()?.muted}><div class="info-row"><BellOff size={18} /><span>Notifications muted</span></div></Show>
                 <Show when={chat()?.archived}><div class="info-row"><Archive size={18} /><span>Archived</span></div></Show>
-                <Show when={chat()?.pinned}><div class="info-row"><ShieldCheck size={18} /><span>Pinned chat</span></div></Show>
-                <Show when={!chat()?.muted && !chat()?.archived && !chat()?.pinned}>
+                <Show when={chat()}>
+                  {(value) => (
+                    <button
+                      type="button"
+                      class={`info-row info-action ${value().pinned ? "active" : ""}`}
+                      onClick={() => void actions.setChatPinned(value().id, !value().pinned)}
+                    >
+                      <Pin size={18} />
+                      <span>{value().pinned ? "Unpin chat" : "Pin chat"}</span>
+                    </button>
+                  )}
+                </Show>
+                <Show when={chat()}>
+                  {(value) => (
+                    <>
+                      <button
+                        type="button"
+                        class={`info-row info-action ${value().archived ? "active" : ""}`}
+                        onClick={() => void actions.setChatArchived(value().id, !value().archived)}
+                      >
+                        <Archive size={18} />
+                        <span>{value().archived ? "Unarchive chat" : "Archive chat"}</span>
+                      </button>
+                      <button
+                        type="button"
+                        class={`info-row info-action ${value().muted ? "active" : ""}`}
+                        onClick={() => void actions.setChatMuted(value().id, !value().muted)}
+                      >
+                        {value().muted ? <BellRing size={18} /> : <BellOff size={18} />}
+                        <span>{value().muted ? "Unmute chat" : "Mute chat"}</span>
+                      </button>
+                      <button
+                        type="button"
+                        class={`info-row info-action ${value().blocked ? "active" : ""}`}
+                        onClick={() => void actions.setChatBlocked(value().id, !value().blocked)}
+                      >
+                        <ShieldCheck size={18} />
+                        <span>{value().blocked ? "Unblock contact" : "Block contact"}</span>
+                      </button>
+                      <button
+                        type="button"
+                        class={`info-row info-action ${value().favorite ? "active" : ""}`}
+                        onClick={() => actions.toggleFavorite(value().id)}
+                      >
+                        <Star size={18} />
+                        <span>{value().favorite ? "Remove from favorites" : "Add to favorites"}</span>
+                      </button>
+                      <Show when={value().kind === ChatKind.Group}>
+                        <button
+                          type="button"
+                          class="info-row info-action"
+                          onClick={() => void actions.leaveGroup(value().id)}
+                        >
+                          <LogOut size={18} />
+                          <span>Leave group (local)</span>
+                        </button>
+                      </Show>
+                    </>
+                  )}
+                </Show>
+                <Show when={!chat()?.muted && !chat()?.archived}>
                   <p>No special chat settings are active.</p>
                 </Show>
               </section>
@@ -557,6 +674,24 @@ export function SettingsPanel(props: { model: AppModel }) {
                       </button>
                     )}
                   </For>
+                </div>
+              </SettingRow>
+              <SettingRow title={t("settings.language")} description="">
+                <div class="segmented-control">
+                  <button
+                    type="button"
+                    class={preferences.language === "en" ? "active" : ""}
+                    onClick={() => prefActions.update("language", "en")}
+                  >
+                    {t("settings.english")}
+                  </button>
+                  <button
+                    type="button"
+                    class={preferences.language === "es" ? "active" : ""}
+                    onClick={() => prefActions.update("language", "es")}
+                  >
+                    {t("settings.spanish")}
+                  </button>
                 </div>
               </SettingRow>
               <SettingRow title="Density" description="Compact tightens spacing for more messages on screen">

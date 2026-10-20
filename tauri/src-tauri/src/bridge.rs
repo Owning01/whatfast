@@ -1,0 +1,1715 @@
+use std::{
+    collections::HashMap,
+    env,
+    io::{BufRead, BufReader, Read, Write},
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+};
+
+use anyhow::{Context as _, Result, bail};
+use prost::Message as _;
+
+use crate::proto::{self, envelope, rpc_request, rpc_response};
+
+pub const PROTOCOL_VERSION: u32 = 21;
+const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug)]
+pub enum BridgeMessage {
+    Envelope(Box<proto::Envelope>),
+    Exited(BridgeExit),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BridgeExitKind {
+    Transient,
+    Fatal,
+}
+
+#[derive(Clone, Debug)]
+pub struct BridgeExit {
+    pub kind: BridgeExitKind,
+    pub message: String,
+}
+
+const MAX_EXIT_DIAGNOSTIC_BYTES: usize = 8 * 1024;
+
+pub struct BackendClient {
+    outgoing: async_channel::Sender<proto::Envelope>,
+    pub incoming: async_channel::Receiver<BridgeMessage>,
+    child: Option<Arc<Mutex<Child>>>,
+}
+
+impl BackendClient {
+    pub fn start(fake: bool) -> Result<Self> {
+        if fake {
+            return Ok(Self::fake());
+        }
+        let executable = backend_executable()?;
+        let data_dir = crate::paths::data_dir();
+        std::fs::create_dir_all(&data_dir)
+            .with_context(|| format!("create app data directory {}", data_dir.display()))?;
+        let log_file = data_dir.join("backend.log");
+        let mut cmd = Command::new(&executable);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+        let mut child = cmd
+            .arg("--stdio")
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .arg("--log-file")
+            .arg(log_file)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("start backend {}", executable.display()))?;
+
+        let stdin = child.stdin.take().context("backend stdin unavailable")?;
+        let stdout = child.stdout.take().context("backend stdout unavailable")?;
+        let stderr = child.stderr.take().context("backend stderr unavailable")?;
+        let child = Arc::new(Mutex::new(child));
+        let diagnostics = Arc::new(Mutex::new(String::new()));
+        let (outgoing, outgoing_rx) = async_channel::bounded(256);
+        let (incoming_tx, incoming) = async_channel::bounded(1024);
+
+        thread::Builder::new()
+            .name("bridge-writer".into())
+            .spawn(move || writer_loop(stdin, outgoing_rx))?;
+        let stderr_thread = thread::Builder::new().name("bridge-stderr".into()).spawn({
+            let diagnostics = diagnostics.clone();
+            move || capture_stderr(stderr, diagnostics)
+        })?;
+        let reader_child = child.clone();
+        thread::Builder::new()
+            .name("bridge-reader".into())
+            .spawn(move || {
+                if let Err(error) = reader_loop(stdout, &incoming_tx) {
+                    let transport_error = error.to_string();
+                    let status = reader_child
+                        .lock()
+                        .ok()
+                        .and_then(|mut child| child.wait().ok())
+                        .map(|status| status.to_string());
+                    let _ = stderr_thread.join();
+                    let diagnostic = diagnostics
+                        .lock()
+                        .map(|value| value.clone())
+                        .unwrap_or_default();
+                    let message = match (diagnostic.trim(), status) {
+                        ("", Some(status)) => {
+                            format!("backend transport failed: {transport_error}; backend {status}")
+                        }
+                        ("", None) => format!("backend transport failed: {transport_error}"),
+                        (diagnostic, Some(status)) => format!(
+                            "backend transport failed: {transport_error}; diagnostics: {diagnostic}; backend {status}"
+                        ),
+                        (diagnostic, None) => format!(
+                            "backend transport failed: {transport_error}; diagnostics: {diagnostic}"
+                        ),
+                    };
+                    eprintln!("{message}");
+                    let _ = incoming_tx.send_blocking(BridgeMessage::Exited(BridgeExit {
+                        kind: classify_exit(&message),
+                        message,
+                    }));
+                }
+            })?;
+
+        Ok(Self {
+            outgoing,
+            incoming,
+            child: Some(child),
+        })
+    }
+
+    pub fn send(&self, request_id: u64, request: rpc_request::Request) -> Result<()> {
+        self.outgoing
+            .try_send(proto::Envelope {
+                protocol_version: PROTOCOL_VERSION,
+                request_id,
+                body: Some(envelope::Body::Request(proto::RpcRequest {
+                    request: Some(request),
+                })),
+            })
+            .context("backend writer unavailable or backpressured")
+    }
+
+    pub fn disconnected() -> Self {
+        let (outgoing, _) = async_channel::bounded(1);
+        let (_, incoming) = async_channel::bounded(1);
+        outgoing.close();
+        Self {
+            outgoing,
+            incoming,
+            child: None,
+        }
+    }
+
+    /// Stop accepting new work, request a graceful backend shutdown, and
+    /// independently guarantee the child is reaped after the grace period.
+    pub fn shutdown(&self) {
+        let _ = self.send(
+            u64::MAX,
+            rpc_request::Request::Shutdown(proto::ShutdownRequest {}),
+        );
+        self.outgoing.close();
+        if let Some(child) = &self.child {
+            spawn_reaper(child.clone());
+        }
+    }
+
+    fn fake() -> Self {
+        let (outgoing, outgoing_rx) = async_channel::bounded(256);
+        let (incoming_tx, incoming) = async_channel::bounded(1024);
+        let event_sequence = Arc::new(Mutex::new(1_u64));
+        let handshaken = Arc::new(AtomicBool::new(false));
+        if env::var("WHATFAST_FAKE_LIVE_EVENTS").as_deref() != Ok("0") {
+            let live_incoming = incoming_tx.clone();
+            let live_sequence = event_sequence.clone();
+            let live_handshaken = handshaken.clone();
+            thread::Builder::new()
+                .name("fake-live-events".into())
+                .spawn(move || fake_live_loop(live_incoming, live_sequence, live_handshaken))
+                .expect("spawn fake live events");
+        }
+        thread::Builder::new()
+            .name("fake-backend".into())
+            .spawn(move || fake_loop(outgoing_rx, incoming_tx, event_sequence, handshaken))
+            .expect("spawn fake backend");
+        Self {
+            outgoing,
+            incoming,
+            child: None,
+        }
+    }
+}
+
+fn capture_stderr(stderr: impl Read, diagnostics: Arc<Mutex<String>>) {
+    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+        eprintln!("whatfast-backend: {line}");
+        if let Ok(mut captured) = diagnostics.lock() {
+            if captured.len() + line.len() + 1 > MAX_EXIT_DIAGNOSTIC_BYTES {
+                let mut remove = (captured.len() + line.len() + 1 - MAX_EXIT_DIAGNOSTIC_BYTES)
+                    .min(captured.len());
+                // `String::drain` panics unless the end bound is a char
+                // boundary; stderr bytes are external input and may be
+                // multibyte, so floor to the previous boundary.
+                while remove > 0 && !captured.is_char_boundary(remove) {
+                    remove -= 1;
+                }
+                captured.drain(..remove);
+            }
+            captured.push_str(&line);
+            captured.push('\n');
+        }
+    }
+}
+
+pub fn classify_exit(message: &str) -> BridgeExitKind {
+    let message = message.to_ascii_lowercase();
+    if [
+        "unsupported_protocol",
+        "protocol version",
+        "profile is already in use",
+        "database disk image is malformed",
+        "file is not a database",
+        "database corruption",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+    {
+        BridgeExitKind::Fatal
+    } else {
+        BridgeExitKind::Transient
+    }
+}
+
+impl Drop for BackendClient {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn spawn_reaper(child: Arc<Mutex<Child>>) {
+    let _ = thread::Builder::new()
+        .name("backend-reaper".into())
+        .spawn(move || {
+            if let Ok(mut child) = child.lock() {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                while std::time::Instant::now() < deadline {
+                    if child.try_wait().ok().flatten().is_some() {
+                        return;
+                    }
+                    thread::sleep(std::time::Duration::from_millis(25));
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        });
+}
+
+fn writer_loop(mut writer: impl Write, outgoing: async_channel::Receiver<proto::Envelope>) {
+    while let Ok(envelope) = outgoing.recv_blocking() {
+        if write_frame(&mut writer, &envelope).is_err() {
+            break;
+        }
+    }
+}
+
+fn reader_loop(
+    mut reader: impl Read,
+    incoming: &async_channel::Sender<BridgeMessage>,
+) -> Result<()> {
+    loop {
+        let envelope = read_frame(&mut reader)?;
+        if envelope.protocol_version != PROTOCOL_VERSION {
+            bail!(
+                "backend sent protocol version {} after v{PROTOCOL_VERSION} handshake",
+                envelope.protocol_version
+            );
+        }
+        if envelope.body.is_none() {
+            bail!("backend sent envelope without a body");
+        }
+        incoming
+            .send_blocking(BridgeMessage::Envelope(Box::new(envelope)))
+            .context("desktop receiver stopped")?;
+    }
+}
+
+fn write_frame(writer: &mut impl Write, envelope: &proto::Envelope) -> Result<()> {
+    let bytes = envelope.encode_to_vec();
+    if bytes.len() > MAX_FRAME_BYTES {
+        bail!("outgoing frame exceeds {MAX_FRAME_BYTES} bytes");
+    }
+    writer.write_all(&(bytes.len() as u32).to_be_bytes())?;
+    writer.write_all(&bytes)?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn read_frame(reader: &mut impl Read) -> Result<proto::Envelope> {
+    let mut prefix = [0_u8; 4];
+    reader.read_exact(&mut prefix)?;
+    let length = u32::from_be_bytes(prefix) as usize;
+    if length == 0 || length > MAX_FRAME_BYTES {
+        bail!("invalid bridge frame length {length}");
+    }
+    let mut payload = vec![0; length];
+    reader.read_exact(&mut payload)?;
+    proto::Envelope::decode(payload.as_slice()).context("decode bridge envelope")
+}
+
+fn backend_executable() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("WHATFAST_BACKEND") {
+        return Ok(path.into());
+    }
+    let current = env::current_exe().context("resolve desktop executable")?;
+    let name = if cfg!(windows) {
+        "whatfast-backend.exe"
+    } else {
+        "whatfast-backend"
+    };
+    Ok(current.parent().unwrap_or(Path::new(".")).join(name))
+}
+
+fn fake_history_coverage(chat_id: String) -> proto::HistoryCoverage {
+    proto::HistoryCoverage {
+        chat_id,
+        state: proto::HistoryCoverageState::Unknown as i32,
+        revision: 1,
+        local_message_count: 1_000,
+        oldest_message_timestamp_ms: 1_700_000_000_000,
+        on_demand_messages_added: 0,
+        last_requested_count: 0,
+        last_received_count: 0,
+        last_added_count: 0,
+        last_requested_at_ms: 0,
+        retry_after_ms: 0,
+        detail: "Older WhatsApp history has not been checked".into(),
+    }
+}
+
+fn fake_integrity_status() -> proto::IntegrityStatus {
+    proto::IntegrityStatus {
+        database_ok: true,
+        detail: "Local database and derived chat state are consistent".into(),
+        pending_inbound: 0,
+        failed_inbound: 0,
+        oldest_pending_at_ms: 0,
+        last_message_persisted_at_ms: 1_700_000_000_000,
+        last_reconciliation_at_ms: 1_700_000_000_000,
+        inconsistent_chats: 0,
+    }
+}
+
+fn fake_loop(
+    outgoing: async_channel::Receiver<proto::Envelope>,
+    incoming: async_channel::Sender<BridgeMessage>,
+    event_sequence: Arc<Mutex<u64>>,
+    handshaken: Arc<AtomicBool>,
+) {
+    let pairing = env::var_os("WHATFAST_FAKE_PAIRING").is_some();
+    let performance_fixture = env::var_os("WHATFAST_PERF_FIXTURE").is_some();
+    let message_total = if performance_fixture { 2_000 } else { 1_000 };
+    // In-memory pins so ListPinnedMessages reflects what SetMessagePin
+    // stored, matching the real backend instead of always returning empty.
+    // NOTE: pins live only for the lifetime of this fake client loop (per
+    // fake backend instance) and are lost on restart; the real backend
+    // persists them. This is intentional for the deterministic fixture.
+    let mut pins: HashMap<String, Vec<proto::PinnedMessage>> = HashMap::new();
+    // In-memory chat settings so the fake mirrors the real backend: archive,
+    // mute and block survive for the lifetime of the fake client loop and are
+    // echoed back by the setter RPCs and by ListChats.
+    let mut chat_settings: HashMap<String, proto::Chat> = HashMap::new();
+    while let Ok(envelope) = outgoing.recv_blocking() {
+        let request_id = envelope.request_id;
+        let Some(envelope::Body::Request(request)) = envelope.body else {
+            continue;
+        };
+        let is_hello = matches!(
+            request.request.as_ref(),
+            Some(rpc_request::Request::Hello(_))
+        );
+        let result = match request.request {
+            Some(rpc_request::Request::Hello(_)) => {
+                rpc_response::Result::Hello(proto::HelloResponse {
+                    backend_version: "fake-0.1".into(),
+                    protocol_version: PROTOCOL_VERSION,
+                })
+            }
+            Some(rpc_request::Request::GetAuthState(_)) => {
+                rpc_response::Result::AuthState(proto::AuthStateResponse {
+                    paired: !pairing,
+                    logged_in: !pairing,
+                    own_user_id: "me@s.whatsapp.net".into(),
+                    connection_state: if pairing {
+                        proto::ConnectionState::Pairing as i32
+                    } else {
+                        proto::ConnectionState::Connected as i32
+                    },
+                })
+            }
+            Some(rpc_request::Request::StartPairing(_)) => {
+                emit_fake_event(
+                    &incoming,
+                    &event_sequence,
+                    proto::backend_event::Event::PairingQr(proto::PairingQr {
+                        code: "2@WHATFAST-FAKE-PAIRING-CODE".into(),
+                        expires_at_ms: 4_102_444_800_000,
+                    }),
+                );
+                rpc_response::Result::StartPairing(proto::StartPairingResponse { started: true })
+            }
+            Some(rpc_request::Request::GetSyncStatus(_)) => {
+                rpc_response::Result::SyncStatus(proto::SyncStatusResponse {
+                    status: Some(proto::SyncStatus {
+                        phase: proto::SyncPhase::Complete as i32,
+                        revision: 1,
+                        chats_processed: 10_000,
+                        messages_processed: message_total as u64,
+                        messages_received: message_total as u64,
+                        messages_decoded: message_total as u64,
+                        messages_failed: 0,
+                        whatsapp_progress: 100,
+                        started_at_ms: 0,
+                        completed_at_ms: 0,
+                        detail: "Up to date".into(),
+                    }),
+                })
+            }
+            Some(rpc_request::Request::GetChatHistoryCoverage(request)) => {
+                rpc_response::Result::GetChatHistoryCoverage(
+                    proto::GetChatHistoryCoverageResponse {
+                        coverage: Some(fake_history_coverage(request.chat_id)),
+                    },
+                )
+            }
+            Some(rpc_request::Request::RequestOlderHistory(request)) => {
+                let mut coverage = fake_history_coverage(request.chat_id);
+                coverage.state = proto::HistoryCoverageState::Requesting as i32;
+                coverage.detail = "Requesting 50 older messages from WhatsApp".into();
+                let mut completed = coverage.clone();
+                completed.state = proto::HistoryCoverageState::Exhausted as i32;
+                completed.revision += 1;
+                completed.detail = "WhatsApp returned no older messages".into();
+                emit_fake_event(
+                    &incoming,
+                    &event_sequence,
+                    proto::backend_event::Event::HistoryCoverageChanged(
+                        proto::HistoryCoverageChanged {
+                            coverage: Some(completed),
+                        },
+                    ),
+                );
+                rpc_response::Result::RequestOlderHistory(proto::RequestOlderHistoryResponse {
+                    coverage: Some(coverage),
+                })
+            }
+            Some(rpc_request::Request::GetHistoryOverview(_)) => {
+                rpc_response::Result::GetHistoryOverview(proto::GetHistoryOverviewResponse {
+                    overview: Some(proto::HistoryOverview {
+                        local_message_count: message_total as u64,
+                        chats_with_messages: 10_000,
+                        chats_checked: 0,
+                        chats_unknown: 10_000,
+                        chats_without_anchor: 0,
+                    }),
+                })
+            }
+            Some(rpc_request::Request::GetIntegrityStatus(_)) => {
+                rpc_response::Result::GetIntegrityStatus(proto::GetIntegrityStatusResponse {
+                    status: Some(fake_integrity_status()),
+                })
+            }
+            Some(rpc_request::Request::RepairLocalCache(_)) => {
+                rpc_response::Result::RepairLocalCache(proto::RepairLocalCacheResponse {
+                    status: Some(fake_integrity_status()),
+                })
+            }
+            Some(rpc_request::Request::ListChats(request)) => {
+                let start = request.cursor.parse::<usize>().unwrap_or(0);
+                let limit = request.limit.min(100) as usize;
+                let total = 10_000_usize;
+                let chats = (start..(start + limit).min(total))
+                    .map(fake_chat)
+                    .map(|mut chat| {
+                        if let Some(settings) = chat_settings.get(&chat.id) {
+                            chat.archived = settings.archived;
+                            chat.muted = settings.muted;
+                            chat.blocked = settings.blocked;
+                            chat.mute_until_ms = settings.mute_until_ms;
+                        }
+                        chat
+                    })
+                    .collect();
+                let next = if start + limit < total {
+                    (start + limit).to_string()
+                } else {
+                    String::new()
+                };
+                rpc_response::Result::ListChats(proto::ListChatsResponse {
+                    chats,
+                    total_count: total as u64,
+                    next_cursor: next,
+                })
+            }
+            Some(rpc_request::Request::ListMessages(request)) => {
+                let end = if request.before_timestamp_ms == 0 {
+                    message_total
+                } else {
+                    request.before_timestamp_ms as usize
+                };
+                let start = end.saturating_sub(request.limit as usize);
+                let messages = (start..end)
+                    .map(|id| fake_message(&request.chat_id, id))
+                    .collect();
+                rpc_response::Result::ListMessages(proto::ListMessagesResponse {
+                    messages,
+                    has_more: start > 0,
+                })
+            }
+            Some(rpc_request::Request::OpenMessageWindow(request)) => {
+                let anchor = message_total.saturating_sub(50);
+                let start = anchor.saturating_sub(25);
+                let end = (anchor + 26).min(message_total);
+                rpc_response::Result::OpenMessageWindow(proto::OpenMessageWindowResponse {
+                    messages: (start..end)
+                        .map(|id| fake_message(&request.chat_id, id))
+                        .collect(),
+                    has_older: start > 0,
+                    has_newer: end < message_total,
+                    first_unread_message_id: format!("message-{anchor}"),
+                })
+            }
+            Some(rpc_request::Request::ListMessagesAfter(request)) => {
+                let start = request
+                    .after_message_id
+                    .strip_prefix("message-")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .map_or(0, |id| id + 1);
+                let end = (start + request.limit as usize).min(message_total);
+                rpc_response::Result::ListMessagesAfter(proto::ListMessagesAfterResponse {
+                    messages: (start..end)
+                        .map(|id| fake_message(&request.chat_id, id))
+                        .collect(),
+                    has_more: end < message_total,
+                })
+            }
+            Some(rpc_request::Request::SearchLocal(request)) => {
+                let query = request.query.to_lowercase();
+                let contacts = (0..8)
+                    .filter_map(|id| {
+                        let chat = fake_chat(id);
+                        (chat.title.to_lowercase().contains(&query)
+                            || chat.phone_number.contains(&query))
+                        .then_some(proto::ContactSearchResult {
+                            contact_jid: format!("1555{id:07}@s.whatsapp.net"),
+                            chat_id: chat.id,
+                            display_name: chat.title,
+                            secondary_name: chat.push_name,
+                            phone_number: chat.phone_number,
+                        })
+                    })
+                    .take(8)
+                    .collect();
+                let groups = (0..40)
+                    .filter(|id| *id % 5 == 0)
+                    .map(fake_chat)
+                    .filter(|chat| chat.title.to_lowercase().contains(&query))
+                    .take(6)
+                    .collect();
+                let messages = if query.chars().count() >= 3 {
+                    (message_total.saturating_sub(25)..message_total)
+                        .map(|id| {
+                            let chat = fake_chat(id % 20);
+                            proto::MessageSearchResult {
+                                chat_id: chat.id.clone(),
+                                message_id: format!("message-{id}"),
+                                chat_title: chat.title.clone(),
+                                sender_name: if id.is_multiple_of(2) {
+                                    "You"
+                                } else {
+                                    "Fast friend"
+                                }
+                                .into(),
+                                timestamp_ms: id as i64,
+                                snippet: format!("Fast native message {id} matching {query}"),
+                                kind: "text".into(),
+                                archived: chat.archived,
+                                chat: Some(chat),
+                            }
+                        })
+                        .take(20)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                rpc_response::Result::SearchLocal(proto::SearchLocalResponse {
+                    contacts,
+                    groups,
+                    messages,
+                })
+            }
+            Some(rpc_request::Request::OpenContact(_request)) => {
+                let mut chat = fake_chat(10_001);
+                chat.title = "New WhatsApp contact".into();
+                rpc_response::Result::OpenContact(proto::OpenContactResponse { chat: Some(chat) })
+            }
+            Some(rpc_request::Request::ListMessagesAround(request)) => {
+                let anchor = request
+                    .message_id
+                    .strip_prefix("message-")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(500);
+                let start = anchor.saturating_sub(25);
+                let end = (anchor + 26).min(message_total);
+                rpc_response::Result::ListMessagesAround(proto::ListMessagesAroundResponse {
+                    messages: (start..end)
+                        .map(|id| fake_message(&request.chat_id, id))
+                        .collect(),
+                    has_older: start > 0,
+                    has_newer: end < message_total,
+                    anchor_message_id: request.message_id,
+                })
+            }
+            Some(rpc_request::Request::GetChatAvatar(request)) => {
+                rpc_response::Result::GetChatAvatar(proto::GetChatAvatarResponse {
+                    chat_id: request.chat_id,
+                    avatar_path: String::new(),
+                })
+            }
+            Some(rpc_request::Request::GetParticipantAvatar(request)) => {
+                rpc_response::Result::GetParticipantAvatar(proto::GetParticipantAvatarResponse {
+                    participant_id: request.participant_id,
+                    avatar_path: String::new(),
+                })
+            }
+            Some(rpc_request::Request::GetChatInfo(request)) => {
+                let id = request
+                    .chat_id
+                    .strip_prefix("chat-")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let chat = fake_chat(id);
+                let group = chat.kind == proto::ChatKind::Group as i32;
+                let participants: Vec<proto::ChatParticipant> = if group {
+                    (0..if performance_fixture { 1_000 } else { 12 })
+                        .map(|index| proto::ChatParticipant {
+                            participant_id: format!("1555{index:07}@s.whatsapp.net"),
+                            display_name: format!("Fast friend {index}"),
+                            phone_number: format!("+1555{index:07}"),
+                            is_admin: index < 2,
+                            is_super_admin: index == 0,
+                            is_me: index == 3,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                rpc_response::Result::GetChatInfo(proto::GetChatInfoResponse {
+                    address: if group {
+                        format!("1234567890-{id}@g.us")
+                    } else {
+                        format!("1555{id:07}@s.whatsapp.net")
+                    },
+                    about: if group {
+                        String::new()
+                    } else {
+                        "Hey there! I am using Whatfast.".into()
+                    },
+                    verified_name: if !group && id.is_multiple_of(3) {
+                        format!("Whatfast Business {id}")
+                    } else {
+                        String::new()
+                    },
+                    description: if group {
+                        format!("Planning the weekend, one message at a time. Group {id}.")
+                    } else {
+                        String::new()
+                    },
+                    created_at_ms: if group { 1_712_345_678_000 } else { 0 },
+                    created_by: if group {
+                        "Fast friend 0".into()
+                    } else {
+                        String::new()
+                    },
+                    participant_count: participants.len() as u32,
+                    participants,
+                    announce_only: group && id.is_multiple_of(10),
+                    locked: group && id.is_multiple_of(15),
+                    disappearing_timer_seconds: if group && id.is_multiple_of(20) {
+                        7 * 24 * 3600
+                    } else {
+                        0
+                    },
+                    is_community: false,
+                    join_approval_required: group && id.is_multiple_of(25),
+                    chat: Some(chat),
+                })
+            }
+            Some(rpc_request::Request::SendText(request)) => {
+                rpc_response::Result::SendText(proto::SendTextResponse {
+                    message: Some(proto::Message {
+                        id: request.client_message_id,
+                        chat_id: request.chat_id,
+                        sender_id: "me@s.whatsapp.net".into(),
+                        sender_name: "You".into(),
+                        from_me: true,
+                        timestamp_ms: 1_900_000_000_000,
+                        status: proto::MessageStatus::Sent as i32,
+                        content: Some(proto::message::Content::Text(proto::TextContent {
+                            text: request.text,
+                            link_preview: None,
+                        })),
+                        reply_to_message_id: request.reply_to_message_id,
+                        reply_to_chat_id: request.reply_to_chat_id,
+                        ..Default::default()
+                    }),
+                })
+            }
+            Some(rpc_request::Request::ForwardMessage(request)) => {
+                rpc_response::Result::ForwardMessage(proto::ForwardMessageResponse {
+                    message: Some(proto::Message {
+                        id: request.client_message_id,
+                        chat_id: request.target_chat_id,
+                        sender_id: "me@s.whatsapp.net".into(),
+                        sender_name: "You".into(),
+                        from_me: true,
+                        timestamp_ms: 1_900_000_000_000,
+                        status: proto::MessageStatus::Sent as i32,
+                        forwarding_score: 1,
+                        content: Some(proto::message::Content::Text(proto::TextContent {
+                            text: format!("Forwarded message {}", request.message_id),
+                            link_preview: None,
+                        })),
+                        ..Default::default()
+                    }),
+                })
+            }
+            Some(rpc_request::Request::EditMessage(request)) => {
+                rpc_response::Result::EditMessage(proto::EditMessageResponse {
+                    message: Some(proto::Message {
+                        id: request.message_id,
+                        chat_id: request.chat_id,
+                        sender_id: "me@s.whatsapp.net".into(),
+                        sender_name: "You".into(),
+                        from_me: true,
+                        timestamp_ms: 1_900_000_000_000,
+                        status: proto::MessageStatus::Sent as i32,
+                        edited: true,
+                        content: Some(proto::message::Content::Text(proto::TextContent {
+                            text: request.text,
+                            link_preview: None,
+                        })),
+                        ..Default::default()
+                    }),
+                })
+            }
+            Some(rpc_request::Request::DeleteMessage(request)) => {
+                let revoked_message = proto::Message {
+                    id: request.message_id.clone(),
+                    chat_id: request.chat_id.clone(),
+                    from_me: true,
+                    timestamp_ms: 1_900_000_000_000,
+                    status: proto::MessageStatus::Sent as i32,
+                    revoked: true,
+                    ..Default::default()
+                };
+                emit_fake_event(
+                    &incoming,
+                    &event_sequence,
+                    proto::backend_event::Event::MessageUpserted(proto::MessageUpserted {
+                        message: Some(revoked_message.clone()),
+                    }),
+                );
+                rpc_response::Result::DeleteMessage(proto::DeleteMessageResponse {
+                    message: Some(revoked_message),
+                })
+            }
+            Some(rpc_request::Request::ListStatuses(_)) => {
+                let mut statuses = Vec::new();
+                for (group_index, sender) in
+                    [("maya@s.whatsapp.net", "Maya Nair"), ("priya@s.whatsapp.net", "Priya Nair")]
+                        .into_iter()
+                        .enumerate()
+                {
+                    let (sender_id, sender_name) = sender;
+                    let messages = (0..2)
+                        .map(|index| {
+                            let mut message = fake_message("status@broadcast", 1_500 - group_index * 50 - index);
+                            message.sender_id = sender_id.to_string();
+                            message.sender_name = sender_name.to_string();
+                            message.sender_phone_number = if group_index == 0 { "5493811000001".into() } else { "5493811000002".into() };
+                            message
+                        })
+                        .collect();
+                    statuses.push(proto::StatusGroup {
+                        sender_id: sender_id.to_string(),
+                        sender_name: sender_name.to_string(),
+                        sender_phone_number: if group_index == 0 { "5493811000001".into() } else { "5493811000002".into() },
+                        messages,
+                    });
+                }
+                rpc_response::Result::ListStatuses(proto::ListStatusesResponse {
+                    chat_id: "status@broadcast".into(),
+                    groups: statuses,
+                })
+            }
+            Some(rpc_request::Request::SubscribeNewsletter(request)) => {
+                // Truncate by chars, never by bytes: byte slicing (`&s[..n]`)
+                // panics when n lands inside a multibyte char (emoji, CJK).
+                let short_key: String = request.invite_key.chars().take(12).collect();
+                let display_key: String = request.invite_key.chars().take(24).collect();
+                let jid = format!("{short_key}@newsletter");
+                rpc_response::Result::SubscribeNewsletter(proto::SubscribeNewsletterResponse {
+                    newsletter: Some(proto::Newsletter {
+                        jid: jid.clone(),
+                        name: format!("Channel {display_key}"),
+                        subscribed_at_ms: 1_900_000_000_000,
+                        muted: false,
+                    }),
+                })
+            }
+            Some(rpc_request::Request::ListNewsletters(_)) => {
+                rpc_response::Result::ListNewsletters(proto::ListNewslettersResponse {
+                    newsletters: vec![
+                        proto::Newsletter {
+                            jid: "news@newsletter".into(),
+                            name: "Whatfast News".into(),
+                            subscribed_at_ms: 1_900_000_000_000,
+                            muted: false,
+                        },
+                        proto::Newsletter {
+                            jid: "dev@newsletter".into(),
+                            name: "Whatfast Dev".into(),
+                            subscribed_at_ms: 1_890_000_000_000,
+                            muted: false,
+                        },
+                    ],
+                })
+            }
+            Some(rpc_request::Request::ListNewsletterMessages(request)) => {
+                let messages = (0..8)
+                    .map(|index| {
+                        let mut message = fake_message(&request.jid, 1_000 - index);
+                        message.chat_id = request.jid.clone();
+                        message.sender_id = request.jid.clone();
+                        message.sender_name = "Channel".into();
+                        message
+                    })
+                    .collect();
+                rpc_response::Result::ListNewsletterMessages(proto::ListNewsletterMessagesResponse {
+                    messages,
+                })
+            }
+            Some(rpc_request::Request::UnsubscribeNewsletter(_)) => {
+                rpc_response::Result::UnsubscribeNewsletter(proto::UnsubscribeNewsletterResponse {})
+            }
+            Some(rpc_request::Request::SetChatPin(request)) => {
+                rpc_response::Result::SetChatPin(proto::SetChatPinResponse {
+                    chat: Some(proto::Chat {
+                        id: request.chat_id.clone(),
+                        kind: proto::ChatKind::Direct as i32,
+                        pinned: request.pinned,
+                        ..Default::default()
+                    }),
+                })
+            }
+            Some(rpc_request::Request::SetChatArchive(request)) => {
+                let chat = chat_settings
+                    .entry(request.chat_id.clone())
+                    .or_insert_with(|| proto::Chat {
+                        id: request.chat_id.clone(),
+                        kind: proto::ChatKind::Direct as i32,
+                        ..Default::default()
+                    });
+                chat.archived = request.archived;
+                rpc_response::Result::SetChatArchive(proto::SetChatArchiveResponse {
+                    chat: Some(chat.clone()),
+                })
+            }
+            Some(rpc_request::Request::SetChatMute(request)) => {
+                let chat = chat_settings
+                    .entry(request.chat_id.clone())
+                    .or_insert_with(|| proto::Chat {
+                        id: request.chat_id.clone(),
+                        kind: proto::ChatKind::Direct as i32,
+                        ..Default::default()
+                    });
+                chat.mute_until_ms = request.mute_until_ms;
+                chat.muted = request.mute_until_ms > 0;
+                rpc_response::Result::SetChatMute(proto::SetChatMuteResponse {
+                    chat: Some(chat.clone()),
+                })
+            }
+            Some(rpc_request::Request::SetChatBlock(request)) => {
+                let chat = chat_settings
+                    .entry(request.chat_id.clone())
+                    .or_insert_with(|| proto::Chat {
+                        id: request.chat_id.clone(),
+                        kind: proto::ChatKind::Direct as i32,
+                        ..Default::default()
+                    });
+                chat.blocked = request.blocked;
+                rpc_response::Result::SetChatBlock(proto::SetChatBlockResponse {
+                    chat: Some(chat.clone()),
+                })
+            }
+            Some(rpc_request::Request::SendImage(request)) => {
+                rpc_response::Result::SendImage(proto::SendImageResponse {
+                    message: Some(proto::Message {
+                        id: request.client_message_id,
+                        chat_id: request.chat_id,
+                        sender_id: "me@s.whatsapp.net".into(),
+                        sender_name: "You".into(),
+                        from_me: true,
+                        timestamp_ms: 1_900_000_000_000,
+                        status: proto::MessageStatus::Sent as i32,
+                        content: Some(proto::message::Content::Image(proto::ImageContent {
+                            caption: request.caption,
+                            mime_type: String::new(),
+                            local_path: request.image_path.clone(),
+                            thumbnail_path: request.image_path,
+                            downloadable: true,
+                            ..Default::default()
+                        })),
+                        reply_to_message_id: request.reply_to_message_id,
+                        reply_to_chat_id: request.reply_to_chat_id,
+                        ..Default::default()
+                    }),
+                })
+            }
+            Some(rpc_request::Request::SendSticker(request)) => {
+                rpc_response::Result::SendSticker(proto::SendStickerResponse {
+                    message: Some(proto::Message {
+                        id: request.client_message_id,
+                        chat_id: request.chat_id,
+                        sender_id: "me@s.whatsapp.net".into(),
+                        sender_name: "You".into(),
+                        from_me: true,
+                        timestamp_ms: 1_900_000_000_000,
+                        status: proto::MessageStatus::Sent as i32,
+                        content: Some(proto::message::Content::Image(proto::ImageContent {
+                            mime_type: "image/webp".into(),
+                            sticker: true,
+                            width: 512,
+                            height: 512,
+                            ..Default::default()
+                        })),
+                        reply_to_message_id: request.reply_to_message_id,
+                        reply_to_chat_id: request.reply_to_chat_id,
+                        ..Default::default()
+                    }),
+                })
+            }
+            Some(rpc_request::Request::GetMessageImage(request)) => {
+                let numeric_id = request
+                    .message_id
+                    .strip_prefix("message-")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let picture = ensure_fake_image(numeric_id);
+                let path = picture.to_string_lossy().into_owned();
+                rpc_response::Result::GetMessageImage(proto::GetMessageImageResponse {
+                    chat_id: request.chat_id,
+                    message_id: request.message_id,
+                    image_path: path.clone(),
+                    thumbnail_path: path,
+                })
+            }
+            Some(rpc_request::Request::GetMessageAttachment(request)) => {
+                rpc_response::Result::GetMessageAttachment(proto::GetMessageAttachmentResponse {
+                    chat_id: request.chat_id,
+                    message_id: request.message_id,
+                    local_path: ensure_fake_audio().to_string_lossy().into_owned(),
+                })
+            }
+            Some(rpc_request::Request::SendAttachment(request)) => fake_send_attachment(request),
+            Some(rpc_request::Request::ListStickers(_)) => {
+                rpc_response::Result::ListStickers(proto::ListStickersResponse {
+                    packs: vec![
+                        proto::StickerPack {
+                            id: "favorites".into(),
+                            name: "Favourites".into(),
+                            stickers: vec![
+                                fake_sticker("fav-1", true),
+                                fake_sticker("fav-2", true),
+                            ],
+                        },
+                        proto::StickerPack {
+                            id: "recent".into(),
+                            name: "Recently used".into(),
+                            stickers: vec![fake_sticker("recent-1", false)],
+                        },
+                    ],
+                })
+            }
+            Some(rpc_request::Request::SendStickerFromLibrary(request)) => {
+                if request.sticker_id.is_empty() {
+                    fake_invalid_argument("client_message_id, chat_id and sticker_id are required")
+                } else {
+                    rpc_response::Result::SendStickerFromLibrary(
+                        proto::SendStickerFromLibraryResponse {
+                            message: Some(proto::Message {
+                                id: request.client_message_id,
+                                chat_id: request.chat_id,
+                                sender_id: "me@s.whatsapp.net".into(),
+                                sender_name: "You".into(),
+                                from_me: true,
+                                timestamp_ms: 1_900_000_000_000,
+                                status: proto::MessageStatus::Sent as i32,
+                                content: Some(proto::message::Content::Image(
+                                    proto::ImageContent {
+                                        mime_type: "image/webp".into(),
+                                        sticker: true,
+                                        width: 512,
+                                        height: 512,
+                                        ..Default::default()
+                                    },
+                                )),
+                                reply_to_message_id: request.reply_to_message_id,
+                                reply_to_chat_id: request.reply_to_chat_id,
+                                ..Default::default()
+                            }),
+                        },
+                    )
+                }
+            }
+            Some(rpc_request::Request::SendReaction(request)) => {
+                let removed = request.emoji.is_empty();
+                rpc_response::Result::SendReaction(proto::SendReactionResponse {
+                    reaction: Some(proto::Reaction {
+                        chat_id: request.chat_id,
+                        message_id: request.message_id,
+                        sender_id: "me@s.whatsapp.net".into(),
+                        emoji: request.emoji,
+                        timestamp_ms: 1_900_000_000_000,
+                        from_me: true,
+                        sender_name: "You".into(),
+                        ..Default::default()
+                    }),
+                    removed,
+                })
+            }
+            Some(rpc_request::Request::RepairRecentReactions(request)) => {
+                rpc_response::Result::RepairRecentReactions(proto::RepairRecentReactionsResponse {
+                    chat_id: request.chat_id,
+                    requested: false,
+                    attempts: 0,
+                })
+            }
+            Some(rpc_request::Request::CreatePoll(request)) => {
+                let mut message = fake_message(&request.chat_id, 1_001);
+                message.from_me = true;
+                message.content = Some(proto::message::Content::Poll(proto::PollContent {
+                    question: request.question,
+                    options: request
+                        .options
+                        .into_iter()
+                        .map(|name| proto::PollOption {
+                            name,
+                            vote_count: 0,
+                            selected_by_me: false,
+                            voters: Vec::new(),
+                        })
+                        .collect(),
+                    selectable_options_count: request.selectable_options_count,
+                    total_voters: 0,
+                }));
+                rpc_response::Result::CreatePoll(proto::CreatePollResponse {
+                    message: Some(message),
+                })
+            }
+            Some(rpc_request::Request::VotePoll(request)) => {
+                let mut message = fake_message(&request.chat_id, 1_001);
+                message.id = request.poll_message_id;
+                message.content = Some(proto::message::Content::Poll(proto::PollContent {
+                    question: "Fake poll".into(),
+                    options: request
+                        .selected_options
+                        .into_iter()
+                        .map(|name| proto::PollOption {
+                            name,
+                            vote_count: 1,
+                            selected_by_me: true,
+                            voters: vec![proto::PollVoter {
+                                user_id: "me@s.whatsapp.net".into(),
+                                display_name: "You".into(),
+                                from_me: true,
+                                ..Default::default()
+                            }],
+                        })
+                        .collect(),
+                    selectable_options_count: 1,
+                    total_voters: 1,
+                }));
+                rpc_response::Result::VotePoll(proto::VotePollResponse {
+                    message: Some(message),
+                })
+            }
+            Some(rpc_request::Request::SetMessagePin(request)) => {
+                let stored = pins.entry(request.chat_id.clone()).or_default();
+                if request.pinned {
+                    if !stored
+                        .iter()
+                        .any(|pin| pin.message_id == request.message_id)
+                    {
+                        let numeric_id = request
+                            .message_id
+                            .strip_prefix("message-")
+                            .and_then(|value| value.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        let mut message = fake_message(&request.chat_id, numeric_id);
+                        message.id = request.message_id.clone();
+                        stored.push(proto::PinnedMessage {
+                            message_id: request.message_id.clone(),
+                            pinned_at_ms: 1_900_000_000_000,
+                            pinned_by: "me@s.whatsapp.net".into(),
+                            message: Some(message),
+                            available: true,
+                        });
+                    }
+                } else {
+                    stored.retain(|pin| pin.message_id != request.message_id);
+                }
+                emit_fake_event(
+                    &incoming,
+                    &event_sequence,
+                    proto::backend_event::Event::PinnedMessagesChanged(
+                        proto::PinnedMessagesChanged {
+                            chat_id: request.chat_id,
+                        },
+                    ),
+                );
+                rpc_response::Result::SetMessagePin(proto::SetMessagePinResponse {})
+            }
+            Some(rpc_request::Request::ListPinnedMessages(request)) => {
+                rpc_response::Result::ListPinnedMessages(proto::ListPinnedMessagesResponse {
+                    pins: pins.get(&request.chat_id).cloned().unwrap_or_default(),
+                })
+            }
+            Some(rpc_request::Request::MarkRead(_)) => {
+                rpc_response::Result::MarkRead(proto::MarkReadResponse {})
+            }
+            Some(rpc_request::Request::SetTyping(_)) => {
+                rpc_response::Result::SetTyping(proto::SetTypingResponse {})
+            }
+            Some(rpc_request::Request::Logout(_)) => {
+                rpc_response::Result::Logout(proto::LogoutResponse {})
+            }
+            Some(rpc_request::Request::Reconnect(_)) => {
+                rpc_response::Result::Reconnect(proto::ReconnectResponse { started: true })
+            }
+            Some(rpc_request::Request::Shutdown(_)) => {
+                rpc_response::Result::Shutdown(proto::ShutdownResponse {})
+            }
+            None => continue,
+        };
+        if incoming
+            .send_blocking(BridgeMessage::Envelope(Box::new(proto::Envelope {
+                protocol_version: PROTOCOL_VERSION,
+                request_id,
+                body: Some(envelope::Body::Response(proto::RpcResponse {
+                    result: Some(result),
+                })),
+            })))
+            .is_err()
+        {
+            return;
+        }
+        if is_hello {
+            // The real backend only exposes events after the Hello response has
+            // been written, so the deterministic backend must keep the same
+            // subscription boundary.
+            handshaken.store(true, Ordering::Release);
+        }
+    }
+}
+
+fn fake_invalid_argument(message: impl Into<String>) -> rpc_response::Result {
+    rpc_response::Result::Error(proto::RpcError {
+        code: "invalid_argument".into(),
+        message: message.into(),
+        retryable: false,
+    })
+}
+
+fn fake_sticker(id: &str, favorite: bool) -> proto::Sticker {
+    proto::Sticker {
+        id: id.into(),
+        local_path: String::new(),
+        mime_type: "image/webp".into(),
+        animated: false,
+        width: 512,
+        height: 512,
+        favorite,
+        last_used_ms: 1_900_000_000_000,
+        source_chat_id: String::new(),
+        source_message_id: String::new(),
+    }
+}
+
+fn fake_send_attachment(request: proto::SendAttachmentRequest) -> rpc_response::Result {
+    let Ok(kind) = proto::AttachmentKind::try_from(request.kind) else {
+        return fake_invalid_argument("unknown attachment kind");
+    };
+    if kind == proto::AttachmentKind::Unspecified {
+        return fake_invalid_argument("attachment kind is required");
+    }
+    if request.voice_note && kind != proto::AttachmentKind::Audio {
+        return fake_invalid_argument("voice_note is only valid for audio attachments");
+    }
+    if kind == proto::AttachmentKind::Audio && !request.caption.is_empty() {
+        return fake_invalid_argument("audio messages do not support captions");
+    }
+    let (kind_name, mime_type, file_name) = match kind {
+        proto::AttachmentKind::Document => (
+            "document",
+            "application/octet-stream",
+            Path::new(&request.file_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("attachment")
+                .to_owned(),
+        ),
+        proto::AttachmentKind::Video => ("video", "video/mp4", String::new()),
+        proto::AttachmentKind::Audio => (
+            "audio",
+            if request.voice_note {
+                "audio/ogg; codecs=opus"
+            } else {
+                "audio/ogg"
+            },
+            String::new(),
+        ),
+        proto::AttachmentKind::Unspecified => unreachable!("validated above"),
+    };
+    rpc_response::Result::SendAttachment(proto::SendAttachmentResponse {
+        message: Some(proto::Message {
+            id: request.client_message_id,
+            chat_id: request.chat_id,
+            sender_id: "me@s.whatsapp.net".into(),
+            sender_name: "You".into(),
+            from_me: true,
+            timestamp_ms: 1_900_000_000_000,
+            status: proto::MessageStatus::Sent as i32,
+            content: Some(proto::message::Content::Attachment(
+                proto::AttachmentContent {
+                    kind: kind_name.into(),
+                    caption: request.caption,
+                    mime_type: mime_type.into(),
+                    file_name,
+                    // Match the real backend's ownership boundary: a selected
+                    // source path is never exposed as a renderable cache asset.
+                    local_path: String::new(),
+                    voice_note: request.voice_note,
+                    downloadable: true,
+                    ..Default::default()
+                },
+            )),
+            reply_to_message_id: request.reply_to_message_id,
+            reply_to_chat_id: request.reply_to_chat_id,
+            ..Default::default()
+        }),
+    })
+}
+
+/// Materialize a tiny real PCM WAV once per profile so fake-mode audio and
+/// voice notes have a playable file to point the inline player at. The file
+/// lives under the managed media tree, which is the only path the asset
+/// protocol serves.
+fn ensure_fake_audio() -> PathBuf {
+    let media_dir = crate::paths::data_dir().join("media");
+    let path = media_dir.join("fake-audio.wav");
+    if path.exists() {
+        return path;
+    }
+    if std::fs::create_dir_all(&media_dir).is_err() {
+        return path;
+    }
+    let sample_rate: u32 = 8000;
+    let seconds: u32 = 2;
+    let samples = (sample_rate * seconds) as usize;
+    let mut data = Vec::with_capacity(samples * 2);
+    for i in 0..samples {
+        let t = i as f32 / sample_rate as f32;
+        let value = (t * 440.0 * std::f32::consts::TAU).sin() * 0.25;
+        data.extend_from_slice(&((value * i16::MAX as f32) as i16).to_le_bytes());
+    }
+    let mut wav = Vec::with_capacity(44 + data.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    wav.extend_from_slice(&data);
+    let _ = std::fs::write(&path, wav);
+    path
+}
+
+fn ensure_fake_image(seed: usize) -> PathBuf {
+    let media_dir = crate::paths::data_dir().join("media");
+    let path = media_dir.join(format!("fake-image-{seed}.png"));
+    if path.exists() {
+        return path;
+    }
+    if std::fs::create_dir_all(&media_dir).is_err() {
+        return path;
+    }
+    let (width, height) = (320_u32, 240_u32);
+    let mut buffer = image::RgbImage::new(width, height);
+    let base = [
+        (seed as u8).wrapping_mul(37).wrapping_add(58),
+        (seed as u8).wrapping_mul(91).wrapping_add(36),
+        (seed as u8).wrapping_mul(53).wrapping_add(74),
+    ];
+    for (x, y, pixel) in buffer.enumerate_pixels_mut() {
+        let fx = x as f32 / width as f32;
+        let fy = y as f32 / height as f32;
+        pixel.0 = [
+            (base[0] as f32 * (1.0 - fy) + 30.0 * fy) as u8,
+            (base[1] as f32 * (1.0 - fx) + 26.0 * fx) as u8,
+            (base[2] as f32 * (1.0 - (fx + fy) / 2.0) + 40.0 * (fx + fy) / 2.0) as u8,
+        ];
+    }
+    if let Ok(mut file) = std::fs::File::create(&path) {
+        let _ = image::DynamicImage::ImageRgb8(buffer).write_to(&mut file, image::ImageFormat::Png);
+    }
+    path
+}
+
+fn emit_fake_event(
+    incoming: &async_channel::Sender<BridgeMessage>,
+    sequence: &Mutex<u64>,
+    event: proto::backend_event::Event,
+) -> bool {
+    let mut sequence = sequence.lock().expect("fake event sequence poisoned");
+    let envelope = proto::Envelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: 0,
+        body: Some(envelope::Body::Event(proto::BackendEvent {
+            sequence: *sequence,
+            event: Some(event),
+        })),
+    };
+    *sequence = sequence.saturating_add(1);
+    incoming
+        .send_blocking(BridgeMessage::Envelope(Box::new(envelope)))
+        .is_ok()
+}
+
+fn fake_live_loop(
+    incoming: async_channel::Sender<BridgeMessage>,
+    sequence: Arc<Mutex<u64>>,
+    handshaken: Arc<AtomicBool>,
+) {
+    while !handshaken.load(Ordering::Acquire) {
+        if incoming.is_closed() {
+            return;
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // The deterministic fixture also exercises the real-time path: incoming
+    // messages appear at the bottom while the chat row moves to the top.
+    thread::sleep(std::time::Duration::from_secs(3));
+    for counter in 1_u64.. {
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis() as i64);
+        let (message_event, chat_event) = fake_live_event_pair(counter, timestamp_ms);
+        // Match the real backend: publish the stored message before its derived
+        // chat preview/unread-count update.
+        if !emit_fake_event(&incoming, &sequence, message_event)
+            || !emit_fake_event(&incoming, &sequence, chat_event)
+        {
+            return;
+        }
+        thread::sleep(std::time::Duration::from_secs(4));
+    }
+}
+
+fn fake_live_event_pair(
+    counter: u64,
+    timestamp_ms: i64,
+) -> (proto::backend_event::Event, proto::backend_event::Event) {
+    let message = proto::Message {
+        id: format!("live-{counter}"),
+        chat_id: "chat-0".into(),
+        sender_id: "friend@s.whatsapp.net".into(),
+        sender_name: "Fast friend".into(),
+        sender_phone_number: "+15551234567".into(),
+        timestamp_ms,
+        status: proto::MessageStatus::Delivered as i32,
+        content: Some(proto::message::Content::Text(proto::TextContent {
+            text: format!("Live message {counter} streamed into the bottom of the chat"),
+            link_preview: None,
+        })),
+        ..Default::default()
+    };
+    let mut chat = fake_chat(0);
+    chat.last_message_preview = message
+        .content
+        .as_ref()
+        .and_then(|content| match content {
+            proto::message::Content::Text(text) => Some(text.text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    chat.last_message_timestamp_ms = timestamp_ms;
+    chat.unread_count = 1;
+    (
+        proto::backend_event::Event::MessageUpserted(proto::MessageUpserted {
+            message: Some(message),
+        }),
+        proto::backend_event::Event::ChatUpserted(proto::ChatUpserted { chat: Some(chat) }),
+    )
+}
+
+fn fake_chat(id: usize) -> proto::Chat {
+    proto::Chat {
+        id: format!("chat-{id}"),
+        kind: if id.is_multiple_of(5) {
+            proto::ChatKind::Group as i32
+        } else {
+            proto::ChatKind::Direct as i32
+        },
+        title: if id.is_multiple_of(5) {
+            format!("Weekend plans {id}")
+        } else {
+            format!("Fast friend {id}")
+        },
+        last_message_preview: format!("This is virtualized conversation number {id}"),
+        last_message_timestamp_ms: 1_900_000_000_000 - id as i64,
+        unread_count: id.is_multiple_of(7) as u32 * ((id % 4) + 1) as u32,
+        pinned: id < 3,
+        phone_number: if !id.is_multiple_of(5) {
+            format!("+1555{id:07}")
+        } else {
+            String::new()
+        },
+        contact_name: if !id.is_multiple_of(5) {
+            format!("Fast friend {id}")
+        } else {
+            String::new()
+        },
+        push_name: if !id.is_multiple_of(5) {
+            format!("Friend {id}")
+        } else {
+            String::new()
+        },
+        ..Default::default()
+    }
+}
+
+fn fake_message(chat_id: &str, id: usize) -> proto::Message {
+    proto::Message {
+        id: format!("message-{id}"),
+        chat_id: chat_id.into(),
+        sender_id: if id.is_multiple_of(2) {
+            "me@s.whatsapp.net"
+        } else {
+            "friend@s.whatsapp.net"
+        }
+        .into(),
+        sender_name: if id.is_multiple_of(2) {
+            "You"
+        } else {
+            "Fast friend"
+        }
+        .into(),
+        sender_phone_number: if id.is_multiple_of(2) {
+            String::new()
+        } else {
+            "+15551234567".into()
+        },
+        from_me: id.is_multiple_of(2),
+        timestamp_ms: id as i64,
+        status: proto::MessageStatus::Read as i32,
+        content: Some(if id.is_multiple_of(37) && id > 0 {
+            // A real picture on disk, so the media path (thumbnail, full
+            // viewer, gallery) is exercised by the fake backend instead of
+            // showing an endless loading placeholder.
+            let picture = ensure_fake_image(id);
+            let path = picture.to_string_lossy().into_owned();
+            proto::message::Content::Image(proto::ImageContent {
+                caption: format!("Photo {id}"),
+                mime_type: "image/png".into(),
+                local_path: path.clone(),
+                thumbnail_path: path,
+                width: 320,
+                height: 240,
+                file_size: std::fs::metadata(&picture).map(|meta| meta.len()).unwrap_or(0),
+                downloadable: true,
+                ..Default::default()
+            })
+        } else {
+            proto::message::Content::Text(proto::TextContent {
+                text: if id.is_multiple_of(9) {
+                    format!(
+                        "A longer message {id}\nwith a second line to exercise variable-height virtualization 🐈"
+                    )
+                } else {
+                    format!("Fast native message {id}")
+                },
+                link_preview: id.is_multiple_of(13).then(|| proto::LinkPreview {
+                    url: "https://example.com/whatfast".into(),
+                    title: "Whatfast link preview".into(),
+                    description: "OpenGraph metadata supplied by the fake backend".into(),
+                    ..Default::default()
+                }),
+            })
+        }),
+        reactions: if id.is_multiple_of(11) {
+            vec![proto::Reaction {
+                chat_id: chat_id.into(),
+                message_id: format!("message-{id}"),
+                sender_id: "friend@s.whatsapp.net".into(),
+                emoji: "🐈".into(),
+                timestamp_ms: id as i64,
+                sender_name: "Fast friend".into(),
+                sender_phone_number: "+15551234567".into(),
+                ..Default::default()
+            }]
+        } else {
+            Vec::new()
+        },
+        reply_to_message_id: if id > 0 && id.is_multiple_of(13) {
+            format!("message-{}", id - 1)
+        } else {
+            String::new()
+        },
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frames_round_trip() {
+        let value = proto::Envelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: 42,
+            body: None,
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &value).unwrap();
+        let decoded = read_frame(&mut bytes.as_slice()).unwrap();
+        assert_eq!(decoded.request_id, 42);
+    }
+
+    #[test]
+    fn oversized_prefix_is_rejected_before_allocation() {
+        let bytes = ((MAX_FRAME_BYTES + 1) as u32).to_be_bytes();
+        assert!(read_frame(&mut bytes.as_slice()).is_err());
+    }
+
+    #[test]
+    fn fake_handshake_opens_event_boundary_after_response() {
+        let (outgoing, outgoing_rx) = async_channel::bounded(2);
+        let (incoming_tx, incoming) = async_channel::bounded(2);
+        let handshaken = Arc::new(AtomicBool::new(false));
+        let worker_handshaken = handshaken.clone();
+        let worker = thread::spawn(move || {
+            fake_loop(
+                outgoing_rx,
+                incoming_tx,
+                Arc::new(Mutex::new(1)),
+                worker_handshaken,
+            );
+        });
+        let request = |request_id, request| proto::Envelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            body: Some(envelope::Body::Request(proto::RpcRequest {
+                request: Some(request),
+            })),
+        };
+        outgoing
+            .send_blocking(request(
+                1,
+                rpc_request::Request::GetAuthState(proto::GetAuthStateRequest {}),
+            ))
+            .unwrap();
+        let _ = incoming.recv_blocking().unwrap();
+        assert!(!handshaken.load(Ordering::Acquire));
+
+        outgoing
+            .send_blocking(request(
+                2,
+                rpc_request::Request::Hello(proto::HelloRequest::default()),
+            ))
+            .unwrap();
+        let response = incoming.recv_blocking().unwrap();
+        assert!(matches!(response, BridgeMessage::Envelope(_)));
+        for _ in 0..100 {
+            if handshaken.load(Ordering::Acquire) {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(handshaken.load(Ordering::Acquire));
+        drop(outgoing);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn fake_attachment_responses_match_v16_contract() {
+        let request = |kind, caption: &str, voice_note| proto::SendAttachmentRequest {
+            client_message_id: "request-id".into(),
+            chat_id: "chat-id".into(),
+            file_path: "/tmp/voice.ogg".into(),
+            kind: kind as i32,
+            caption: caption.into(),
+            reply_to_message_id: "reply-id".into(),
+            reply_to_chat_id: "source-chat-id".into(),
+            voice_note,
+        };
+        let rpc_response::Result::SendAttachment(response) =
+            fake_send_attachment(request(proto::AttachmentKind::Audio, "", true))
+        else {
+            panic!("valid voice note did not return send_attachment");
+        };
+        let message = response.message.unwrap();
+        let Some(proto::message::Content::Attachment(attachment)) = message.content else {
+            panic!("fake response did not contain attachment content");
+        };
+        assert_eq!(attachment.kind, "audio");
+        assert_eq!(attachment.mime_type, "audio/ogg; codecs=opus");
+        assert!(attachment.voice_note);
+        assert!(attachment.local_path.is_empty());
+        assert_eq!(message.reply_to_message_id, "reply-id");
+        assert_eq!(message.reply_to_chat_id, "source-chat-id");
+
+        assert!(matches!(
+            fake_send_attachment(request(proto::AttachmentKind::Unspecified, "", false)),
+            rpc_response::Result::Error(_)
+        ));
+        assert!(matches!(
+            fake_send_attachment(request(proto::AttachmentKind::Video, "", true)),
+            rpc_response::Result::Error(_)
+        ));
+        assert!(matches!(
+            fake_send_attachment(request(proto::AttachmentKind::Audio, "caption", false)),
+            rpc_response::Result::Error(_)
+        ));
+    }
+
+    #[test]
+    fn fake_live_pair_matches_backend_event_order() {
+        let (message_event, chat_event) = fake_live_event_pair(7, 1234);
+        let proto::backend_event::Event::MessageUpserted(message) = message_event else {
+            panic!("first event was not the message upsert");
+        };
+        let proto::backend_event::Event::ChatUpserted(chat) = chat_event else {
+            panic!("second event was not the derived chat upsert");
+        };
+        let message = message.message.unwrap();
+        let chat = chat.chat.unwrap();
+        assert_eq!(message.timestamp_ms, chat.last_message_timestamp_ms);
+        assert_eq!(chat.unread_count, 1);
+        assert!(chat.last_message_preview.contains("Live message 7"));
+    }
+
+    #[test]
+    fn fake_event_emission_is_monotonic() {
+        let (incoming, received) = async_channel::bounded(2);
+        let sequence = Mutex::new(41);
+        for detail in ["first", "second"] {
+            assert!(emit_fake_event(
+                &incoming,
+                &sequence,
+                proto::backend_event::Event::ConnectionChanged(proto::ConnectionChanged {
+                    detail: detail.into(),
+                    ..Default::default()
+                }),
+            ));
+        }
+        let sequences: Vec<_> = (0..2)
+            .map(|_| match received.recv_blocking().unwrap() {
+                BridgeMessage::Envelope(envelope) => match envelope.body {
+                    Some(envelope::Body::Event(event)) => event.sequence,
+                    _ => panic!("fake event used the wrong envelope body"),
+                },
+                BridgeMessage::Exited(_) => panic!("fake bridge exited"),
+            })
+            .collect();
+        assert_eq!(sequences, [41, 42]);
+    }
+
+    #[test]
+    fn exit_classification_never_retries_terminal_profile_protocol_or_data_failures() {
+        for message in [
+            "Whatfast profile is already in use",
+            "unsupported_protocol",
+            "backend sent protocol version 99",
+            "database disk image is malformed",
+            "file is not a database",
+        ] {
+            assert_eq!(classify_exit(message), BridgeExitKind::Fatal, "{message}");
+        }
+        assert_eq!(
+            classify_exit("failed to fill whole buffer; backend signal: 9"),
+            BridgeExitKind::Transient
+        );
+    }
+}

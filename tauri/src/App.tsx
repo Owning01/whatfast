@@ -9,6 +9,7 @@ import {
 import { createAppModel } from "./state/app";
 import { Sidebar } from "./components/Sidebar";
 import { Conversation } from "./components/Conversation";
+import { NewsletterPanel } from "./components/NewsletterPanel";
 import { TitleBar } from "./components/TitleBar";
 import { MemberPanel } from "./components/MemberPanel";
 import { ChatSwitcher } from "./components/ChatSwitcher";
@@ -29,6 +30,7 @@ import { IconButton } from "./components/Primitives";
 import { ThemeIcon } from "./components/ThemeIcon";
 import { listenForFileDrops } from "./lib/bridge";
 import { classifyDroppedFiles } from "./lib/file-drop";
+import { t } from "./lib/i18n";
 
 export default function App() {
   const model = createAppModel();
@@ -70,13 +72,23 @@ export default function App() {
         return;
       }
       const batch = classifyDroppedFiles(event.paths);
-      actions.requestFileSend(
+      void actions.requestFileSend(
         event.paths,
         batch.mode,
         batch.attachmentKind,
         false,
         state.selectedChatId,
-      );
+      ).then((accepted) => {
+        // Never let a drop disappear silently: the reviewer refuses new batches
+        // while a send is running or another review is already open.
+        if (!accepted) {
+          actions.notifyError(new Error(
+            state.sending
+              ? "Wait for the current send to finish before dropping more files."
+              : "Finish reviewing the files already queued before dropping more.",
+          ));
+        }
+      });
     }).then((unlisten) => {
       if (disposed) unlisten();
       else unlistenFileDrops = unlisten;
@@ -113,24 +125,24 @@ export default function App() {
         >
           <TitleBar model={model} />
           <nav class="nav-rail" aria-label="Primary navigation">
-            <div class="brand-mark" aria-label="Whatfast">
-              <ThemeIcon icon={MessageCircle} name="chat" size={22} />
-            </div>
             <IconButton
-              label={preferences.sidebarCollapsed ? "Show chat list" : "Hide chat list"}
+              label="Chats"
               active={!preferences.sidebarCollapsed}
-              onClick={() => prefActions.update("sidebarCollapsed", !preferences.sidebarCollapsed)}
+              onClick={() => {
+                if (preferences.sidebarCollapsed) prefActions.update("sidebarCollapsed", false);
+                actions.setFilter("all");
+              }}
             >
-              <ThemeIcon icon={MessageCircle} name="chat" size={21} />
+              <ThemeIcon icon={MessageCircle} name="chat" size={22} />
             </IconButton>
-            <IconButton label="Quick search (Ctrl+K)" onClick={toggleSpotlight}>
+            <IconButton label={t("titlebar.quickSearch")} onClick={toggleSpotlight}>
               <ThemeIcon icon={Search} name="search" size={20} />
             </IconButton>
             <div class="nav-spacer" />
-            <IconButton label="Privacy architecture" onClick={() => actions.toggleSettings(true)}>
+            <IconButton label={t("titlebar.privacy")} onClick={() => actions.toggleSettings(true)}>
               <ThemeIcon icon={ShieldCheck} name="shield" size={20} />
             </IconButton>
-            <IconButton label="Settings" active={state.settingsOpen} onClick={() => actions.toggleSettings()}>
+            <IconButton label={t("titlebar.settings")} active={state.settingsOpen} onClick={() => actions.toggleSettings()}>
               <ThemeIcon icon={Settings} name="settings" size={20} />
             </IconButton>
           </nav>
@@ -147,7 +159,9 @@ export default function App() {
                       onFocusIn={() => actions.focusPane(pane.id)}
                     >
                       <Show when={pane.activeChatId} fallback={<EmptyConversation />}>
-                        <Conversation model={model} chatId={pane.activeChatId} paneId={pane.id} />
+                        <Show when={index() === 0 && state.selectedNewsletter} fallback={<Conversation model={model} chatId={pane.activeChatId} paneId={pane.id} />}>
+                          <NewsletterPanel model={model} />
+                        </Show>
                       </Show>
                     </div>
                   </>
@@ -194,6 +208,22 @@ export default function App() {
 
     if ((event.ctrlKey || event.metaKey) && event.key.toLocaleLowerCase() === "k") {
       toggleSpotlight();
+      event.preventDefault();
+      return;
+    }
+    if ((event.ctrlKey || event.metaKey) && event.key.toLocaleLowerCase() === "n") {
+      searchInput?.focus();
+      event.preventDefault();
+      return;
+    }
+    if ((event.ctrlKey || event.metaKey) && event.key.toLocaleLowerCase() === "f" && !editing) {
+      window.dispatchEvent(new CustomEvent("whatfast:focus-chat-search"));
+      event.preventDefault();
+      return;
+    }
+    if ((event.ctrlKey || event.metaKey) && event.key.toLocaleLowerCase() === "e") {
+      if (state.chatInfoOpen) actions.hideChatInfo();
+      else if (state.selectedChatId) void actions.showChatInfo();
       event.preventDefault();
       return;
     }

@@ -146,10 +146,18 @@ export interface Chat {
   muted: boolean;
   pinned: boolean;
   archived: boolean;
+  /** Local-only favorite flag (linked-device scope has no favorites RPC). */
+  favorite?: boolean;
+  /** Local-only block flag mirrored from the browser mock / optimistic state. */
+  blocked?: boolean;
+  /** Local-only mute expiry; null/0 means muted indefinitely or not muted. */
+  muteUntilMs?: number;
   phoneNumber: string;
   contactName: string;
   pushName: string;
   businessName: string;
+  lastMessageFromMe: boolean;
+  transportJid: string;
 }
 
 export interface LinkPreview {
@@ -332,6 +340,80 @@ export interface SendTextResponse {
 }
 export type ForwardMessageResponse = SendTextResponse;
 export type EditMessageResponse = SendTextResponse;
+export type DeleteMessageResponse = SendTextResponse;
+
+export interface StatusGroup {
+  senderId: string;
+  senderName: string;
+  senderPhoneNumber: string;
+  messages: Message[];
+}
+
+export interface ListStatusesResponse {
+  chatId: string;
+  groups: StatusGroup[];
+}
+
+export interface Newsletter {
+  jid: string;
+  name: string;
+  subscribedAtMs: number;
+  muted: boolean;
+  /** Local-only channel created in the browser mock (badge "local"). */
+  local?: boolean;
+  description?: string;
+}
+
+export interface SubscribeNewsletterResponse {
+  newsletter: Newsletter | null;
+}
+
+export interface ListNewslettersResponse {
+  newsletters: Newsletter[];
+}
+
+export interface ListNewsletterMessagesResponse {
+  messages: Message[];
+}
+
+export interface SetChatPinResponse {
+  chat: Chat | null;
+}
+export type ArchiveChatResponse = SetChatPinResponse;
+export type MuteChatResponse = SetChatPinResponse;
+export type BlockChatResponse = SetChatPinResponse;
+
+/**
+ * A chat muted "indefinitely" carries this far-future instant instead of a
+ * zero, so the same field covers both cases.
+ */
+export const MUTE_UNTIL_INDEFINITE = 253_402_300_799_000;
+
+/**
+ * A media file the desktop core accepted and copied into its own staging
+ * area. Only `path` may be sent to the backend.
+ */
+export interface StagedMedia {
+  path: string;
+  fileName: string;
+  mimeType: string;
+  size: number;
+  width: number;
+  height: number;
+}
+
+export interface StickerPack {
+  id: string;
+  name: string;
+  stickerIds: string[];
+  cover?: string;
+}
+
+export interface ListStickersResponse {
+  packs: StickerPack[];
+}
+
+export type SendStickerFromLibraryResponse = SendStickerResponse;
 export type CreatePollResponse = SendTextResponse;
 export type VotePollResponse = SendTextResponse;
 export type SetMessagePinResponse = EmptyResponse;

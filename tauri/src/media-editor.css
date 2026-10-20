@@ -1,0 +1,122 @@
+/* Image editor: crop and rotate a picture before it is sent. */
+
+.media-editor {
+  width: min(560px, 92vw);
+  max-height: 92vh;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.media-editor .forward-dialog-heading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.media-editor .forward-dialog-heading h2 {
+  margin: 0;
+  flex: 1;
+}
+
+.media-editor-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-muted, #667781);
+  cursor: pointer;
+}
+
+.media-editor-close:hover {
+  background: var(--surface-hover, rgba(11, 20, 26, 0.08));
+}
+
+.media-editor-file {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-muted, #667781);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.media-editor-stage {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 220px;
+  padding: 12px;
+  border-radius: 14px;
+  background: var(--surface-sunken, #10171c);
+  overflow: hidden;
+}
+
+.media-editor-surface {
+  position: relative;
+  touch-action: none;
+  cursor: crosshair;
+  user-select: none;
+}
+
+.media-editor-image {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform-origin: center center;
+  pointer-events: none;
+  max-width: none;
+  user-select: none;
+}
+
+.media-editor-crop {
+  position: absolute;
+  box-sizing: border-box;
+  border: 2px solid #25d366;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.18);
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.45);
+  cursor: move;
+}
+
+.media-editor-handle {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #25d366;
+  border: 2px solid #ffffff;
+  transform: translate(-50%, -50%);
+}
+
+.media-editor-handle[style*="right"] {
+  transform: translate(50%, -50%);
+}
+
+.media-editor-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted, #667781);
+}
+
+.media-editor-toolbar {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.media-editor-toolbar .secondary-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.media-editor .primary-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}

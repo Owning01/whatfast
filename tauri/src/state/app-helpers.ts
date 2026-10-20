@@ -1,7 +1,7 @@
 import type { Chat, Message } from "../lib/types";
 import type { Draft, Mention } from "./app";
 
-export const MAX_ACTIVE_MESSAGES = 2_000;
+export const MAX_ACTIVE_MESSAGES = 250;
 
 export function sortChats(chats: Chat[]): Chat[] {
   return [...chats].sort(

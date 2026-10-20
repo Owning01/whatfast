@@ -1,4 +1,5 @@
 import { createStore } from "solid-js/store";
+import { setLocale } from "../lib/i18n";
 import {
   BUILTIN_THEMES,
   DEFAULT_THEME_ID,
@@ -40,6 +41,8 @@ export interface Preferences {
   notificationsEnabled: boolean;
   /** Include message text in the operating system notification. */
   notificationPreviews: boolean;
+  /** UI language; "en" is the default, "es" ships with the app. */
+  language: "en" | "es";
 }
 
 const defaults: Preferences = {
@@ -58,6 +61,7 @@ const defaults: Preferences = {
   batterySaver: false,
   notificationsEnabled: true,
   notificationPreviews: true,
+  language: "en",
 };
 
 function readStored(): Partial<Preferences> {
@@ -121,6 +125,7 @@ function sanitize(stored: Partial<Preferences>): Preferences {
     batterySaver: stored.batterySaver ?? defaults.batterySaver,
     notificationsEnabled: stored.notificationsEnabled ?? defaults.notificationsEnabled,
     notificationPreviews: stored.notificationPreviews ?? defaults.notificationPreviews,
+    language: stored.language === "es" ? "es" : defaults.language,
   };
 }
 
@@ -149,6 +154,7 @@ export function createPreferences() {
     root.style.setProperty("--scale", preferences.uiScale.toString());
     root.dataset.density = preferences.density;
     root.dataset.batterySaver = preferences.batterySaver ? "true" : "false";
+    setLocale(preferences.language);
   }
 
   function update<K extends keyof Preferences>(key: K, value: Preferences[K]) {

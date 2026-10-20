@@ -26,7 +26,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 )
 
-const ProtocolVersion uint32 = 20
+const ProtocolVersion uint32 = 21
 const maxTextBytes = 65_536
 const maxConcurrentMediaJobs = 4
 const maxMediaJobsInFlight = 32
@@ -582,6 +582,153 @@ func (s *Server) dispatch(request *bridgev1.RpcRequest) (any, error) {
 			return nil, err
 		}
 		return &bridgev1.RpcResponse_EditMessage{EditMessage: &bridgev1.EditMessageResponse{Message: s.wireMessage(message)}}, nil
+	case *bridgev1.RpcRequest_DeleteMessage:
+		if req.DeleteMessage.GetChatId() == "" || req.DeleteMessage.GetMessageId() == "" {
+			return nil, fail("invalid_argument", "chat_id and message_id are required", false)
+		}
+		if !s.wa.IsConnected() {
+			return nil, fail("not_connected", "WhatsApp is not connected", true)
+		}
+		message, err := s.wa.DeleteMessage(s.ctx, req.DeleteMessage.GetChatId(), req.DeleteMessage.GetMessageId(), req.DeleteMessage.GetDeleteForEveryone())
+		if errors.Is(err, wa.ErrDeleteNotAllowed) {
+			return nil, fail("delete_not_allowed", err.Error(), false)
+		}
+		if err != nil {
+			return nil, err
+		}
+		return &bridgev1.RpcResponse_DeleteMessage{DeleteMessage: &bridgev1.DeleteMessageResponse{Message: s.wireMessage(message)}}, nil
+	case *bridgev1.RpcRequest_ListStatuses:
+		chatID, err := s.store.ResolveChat(s.ctx, "status@broadcast")
+		if err != nil {
+			return nil, err
+		}
+		items, err := s.store.StatusMessagesSince(s.ctx, time.Now().Add(-24*time.Hour))
+		if err != nil {
+			return nil, err
+		}
+		identities := make(map[string]wireIdentity)
+		groups := make([]*bridgev1.StatusGroup, 0, 8)
+		var current *bridgev1.StatusGroup
+		for _, item := range items {
+			wire := s.wireMessageWithIdentities(item, identities)
+			if current == nil || current.SenderId != item.SenderJID {
+				current = &bridgev1.StatusGroup{
+					SenderId:          item.SenderJID,
+					SenderName:        wire.GetSenderName(),
+					SenderPhoneNumber: wire.GetSenderPhoneNumber(),
+				}
+				groups = append(groups, current)
+			}
+			current.Messages = append(current.Messages, wire)
+		}
+		return &bridgev1.RpcResponse_ListStatuses{ListStatuses: &bridgev1.ListStatusesResponse{ChatId: chatID, Groups: groups}}, nil
+	case *bridgev1.RpcRequest_SubscribeNewsletter:
+		key := strings.TrimSpace(req.SubscribeNewsletter.GetInviteKey())
+		if key == "" {
+			return nil, fail("invalid_argument", "invite_key is required", false)
+		}
+		newsletter, err := s.wa.SubscribeNewsletter(s.ctx, key)
+		if err != nil {
+			return nil, fail("newsletter_unavailable", err.Error(), s.wa.IsConnected())
+		}
+		return &bridgev1.RpcResponse_SubscribeNewsletter{SubscribeNewsletter: &bridgev1.SubscribeNewsletterResponse{Newsletter: wireNewsletter(newsletter)}}, nil
+	case *bridgev1.RpcRequest_ListNewsletters:
+		newsletters, err := s.wa.ListNewsletters(s.ctx)
+		if err != nil {
+			return nil, err
+		}
+		items := make([]*bridgev1.Newsletter, len(newsletters))
+		for i, newsletter := range newsletters {
+			items[i] = wireNewsletter(newsletter)
+		}
+		return &bridgev1.RpcResponse_ListNewsletters{ListNewsletters: &bridgev1.ListNewslettersResponse{Newsletters: items}}, nil
+	case *bridgev1.RpcRequest_ListNewsletterMessages:
+		if req.ListNewsletterMessages.GetJid() == "" {
+			return nil, fail("invalid_argument", "jid is required", false)
+		}
+		posts, err := s.wa.NewsletterMessages(s.ctx, req.ListNewsletterMessages.GetJid(), int(req.ListNewsletterMessages.GetLimit()))
+		if err != nil {
+			return nil, fail("newsletter_unavailable", err.Error(), s.wa.IsConnected())
+		}
+		identities := make(map[string]wireIdentity)
+		messages := make([]*bridgev1.Message, len(posts))
+		for i, post := range posts {
+			messages[i] = s.wireMessageWithIdentities(post, identities)
+		}
+		return &bridgev1.RpcResponse_ListNewsletterMessages{ListNewsletterMessages: &bridgev1.ListNewsletterMessagesResponse{Messages: messages}}, nil
+	case *bridgev1.RpcRequest_UnsubscribeNewsletter:
+		if req.UnsubscribeNewsletter.GetJid() == "" {
+			return nil, fail("invalid_argument", "jid is required", false)
+		}
+		if err := s.wa.UnsubscribeNewsletter(s.ctx, req.UnsubscribeNewsletter.GetJid()); err != nil {
+			return nil, err
+		}
+		return &bridgev1.RpcResponse_UnsubscribeNewsletter{UnsubscribeNewsletter: &bridgev1.UnsubscribeNewsletterResponse{}}, nil
+	case *bridgev1.RpcRequest_SetChatPin:
+		if req.SetChatPin.GetChatId() == "" {
+			return nil, fail("invalid_argument", "chat_id is required", false)
+		}
+		if err := s.store.SetChatPinned(s.ctx, req.SetChatPin.GetChatId(), req.SetChatPin.GetPinned()); err != nil {
+			return nil, err
+		}
+		chat, err := s.store.Chat(s.ctx, req.SetChatPin.GetChatId())
+		if err != nil {
+			return nil, err
+		}
+		if s.wa != nil {
+			s.Emit(wa.Event{Kind: "chat", Chat: chat})
+		}
+		return &bridgev1.RpcResponse_SetChatPin{SetChatPin: &bridgev1.SetChatPinResponse{Chat: s.wireChat(chat)}}, nil
+	case *bridgev1.RpcRequest_SetChatArchive:
+		if req.SetChatArchive.GetChatId() == "" {
+			return nil, fail("invalid_argument", "chat_id is required", false)
+		}
+		archived := req.SetChatArchive.GetArchived()
+		if err := s.store.UpsertChatMetadata(s.ctx, req.SetChatArchive.GetChatId(), "", &archived); err != nil {
+			return nil, err
+		}
+		chat, err := s.store.Chat(s.ctx, req.SetChatArchive.GetChatId())
+		if err != nil {
+			return nil, err
+		}
+		if s.wa != nil {
+			s.Emit(wa.Event{Kind: "chat", Chat: chat})
+		}
+		return &bridgev1.RpcResponse_SetChatArchive{SetChatArchive: &bridgev1.SetChatArchiveResponse{Chat: s.wireChat(chat)}}, nil
+	case *bridgev1.RpcRequest_SetChatMute:
+		if req.SetChatMute.GetChatId() == "" {
+			return nil, fail("invalid_argument", "chat_id is required", false)
+		}
+		muteUntil := req.SetChatMute.GetMuteUntilMs()
+		if muteUntil < 0 {
+			return nil, fail("invalid_argument", "mute_until_ms must not be negative", false)
+		}
+		if err := s.store.SetChatMute(s.ctx, req.SetChatMute.GetChatId(), muteUntil); err != nil {
+			return nil, err
+		}
+		chat, err := s.store.Chat(s.ctx, req.SetChatMute.GetChatId())
+		if err != nil {
+			return nil, err
+		}
+		if s.wa != nil {
+			s.Emit(wa.Event{Kind: "chat", Chat: chat})
+		}
+		return &bridgev1.RpcResponse_SetChatMute{SetChatMute: &bridgev1.SetChatMuteResponse{Chat: s.wireChat(chat)}}, nil
+	case *bridgev1.RpcRequest_SetChatBlock:
+		if req.SetChatBlock.GetChatId() == "" {
+			return nil, fail("invalid_argument", "chat_id is required", false)
+		}
+		if err := s.store.SetChatBlocked(s.ctx, req.SetChatBlock.GetChatId(), req.SetChatBlock.GetBlocked()); err != nil {
+			return nil, err
+		}
+		chat, err := s.store.Chat(s.ctx, req.SetChatBlock.GetChatId())
+		if err != nil {
+			return nil, err
+		}
+		if s.wa != nil {
+			s.Emit(wa.Event{Kind: "chat", Chat: chat})
+		}
+		return &bridgev1.RpcResponse_SetChatBlock{SetChatBlock: &bridgev1.SetChatBlockResponse{Chat: s.wireChat(chat)}}, nil
 	case *bridgev1.RpcRequest_SendImage:
 		if req.SendImage.GetClientMessageId() == "" || req.SendImage.GetChatId() == "" || req.SendImage.GetImagePath() == "" {
 			return nil, fail("invalid_argument", "client_message_id, chat_id and image_path are required", false)
@@ -994,6 +1141,26 @@ func success(result any) *bridgev1.RpcResponse {
 		response.Result = value
 	case *bridgev1.RpcResponse_Shutdown:
 		response.Result = value
+	case *bridgev1.RpcResponse_DeleteMessage:
+		response.Result = value
+	case *bridgev1.RpcResponse_ListStatuses:
+		response.Result = value
+	case *bridgev1.RpcResponse_SubscribeNewsletter:
+		response.Result = value
+	case *bridgev1.RpcResponse_ListNewsletters:
+		response.Result = value
+	case *bridgev1.RpcResponse_ListNewsletterMessages:
+		response.Result = value
+	case *bridgev1.RpcResponse_UnsubscribeNewsletter:
+		response.Result = value
+	case *bridgev1.RpcResponse_SetChatPin:
+		response.Result = value
+	case *bridgev1.RpcResponse_SetChatArchive:
+		response.Result = value
+	case *bridgev1.RpcResponse_SetChatMute:
+		response.Result = value
+	case *bridgev1.RpcResponse_SetChatBlock:
+		response.Result = value
 	default:
 		response.Result = &bridgev1.RpcResponse_Error{Error: &bridgev1.RpcError{Code: "internal", Message: "invalid backend response"}}
 	}
@@ -1014,7 +1181,11 @@ func wireChat(c domain.Chat) *bridgev1.Chat {
 	if title == "" {
 		title = c.AddressJID
 	}
-	return &bridgev1.Chat{Id: c.JID, Kind: kind, Title: title, LastMessagePreview: c.LastMessageText, LastMessageTimestampMs: c.LastMessageAt.UnixMilli(), UnreadCount: uint32(c.UnreadCount), Muted: c.MutedUntil.After(time.Now()), Archived: c.Archived}
+	mutedUntilMs := int64(0)
+	if c.MutedUntil.After(time.Now()) {
+		mutedUntilMs = c.MutedUntil.UnixMilli()
+	}
+	return &bridgev1.Chat{Id: c.JID, Kind: kind, Title: title, LastMessagePreview: c.LastMessageText, LastMessageTimestampMs: c.LastMessageAt.UnixMilli(), UnreadCount: uint32(c.UnreadCount), Muted: mutedUntilMs > 0, Archived: c.Archived, LastMessageFromMe: c.LastMessageFromMe, TransportJid: c.AddressJID, Pinned: c.Pinned, Blocked: c.Blocked, MuteUntilMs: mutedUntilMs}
 }
 
 func (s *Server) wireChat(c domain.Chat) *bridgev1.Chat {
@@ -1410,4 +1581,13 @@ func authConnectionState(client *wa.Client) bridgev1.ConnectionState {
 		return bridgev1.ConnectionState_CONNECTION_STATE_OFFLINE
 	}
 	return bridgev1.ConnectionState_CONNECTION_STATE_PAIRING
+}
+
+func wireNewsletter(newsletter domain.Newsletter) *bridgev1.Newsletter {
+	return &bridgev1.Newsletter{
+		Jid:            newsletter.JID,
+		Name:           newsletter.Name,
+		SubscribedAtMs: newsletter.SubscribedAt.UnixMilli(),
+		Muted:          newsletter.Muted,
+	}
 }

@@ -3,15 +3,18 @@ package domain
 import "time"
 
 type Chat struct {
-	JID             string
-	AddressJID      string
-	Name            string
-	LastMessageID   string
-	LastMessageText string
-	LastMessageAt   time.Time
-	UnreadCount     int64
-	MutedUntil      time.Time
-	Archived        bool
+	JID               string
+	AddressJID        string
+	Name              string
+	LastMessageID     string
+	LastMessageText   string
+	LastMessageAt     time.Time
+	LastMessageFromMe bool
+	UnreadCount       int64
+	MutedUntil        time.Time
+	Archived          bool
+	Pinned            bool
+	Blocked           bool
 }
 
 type MessageSearchHit struct {
@@ -31,6 +34,13 @@ type MessageWindow struct {
 	HasOlder bool
 	HasNewer bool
 	AnchorID string
+}
+
+type Newsletter struct {
+	JID          string
+	Name         string
+	SubscribedAt time.Time
+	Muted        bool
 }
 
 type Message struct {

@@ -16,6 +16,7 @@ export type ThemeIconName =
   | "globe"
   | "maximize"
   | "messages"
+  | "mic"
   | "minimize"
   | "new-chat"
   | "palette"
@@ -74,6 +75,11 @@ function Glyph(props: { name: ThemeIconName }): JSX.Element {
       <Match when={props.name === "messages"}>
         <path d="M2.5 5.5A3.5 3.5 0 0 1 6 2h8a3.5 3.5 0 0 1 3.5 3.5v5A3.5 3.5 0 0 1 14 14H9l-4.6 3.2.8-3.6a3.5 3.5 0 0 1-2.7-3.4z" />
         <path d="M9 16h6.3l3.8 2.7-.7-3a3.2 3.2 0 0 0 3.1-3.2V9A3.5 3.5 0 0 0 18 5.5v5A4.5 4.5 0 0 1 13.5 15H9z" opacity=".72" />
+      </Match>
+      <Match when={props.name === "mic"}>
+        <rect x="9" y="2.5" width="6" height="12" rx="3" />
+        <path d="M5.5 11.5a6.5 6.5 0 0 0 13 0" />
+        <path d="M12 18v3.5" />
       </Match>
       <Match when={props.name === "new-chat"}>
         <path d="M2 5.5A3.5 3.5 0 0 1 5.5 2h9A3.5 3.5 0 0 1 18 5.5v6a3.5 3.5 0 0 1-3.5 3.5H9l-4.8 3.4.8-3.8a3.5 3.5 0 0 1-3-3.5z" />

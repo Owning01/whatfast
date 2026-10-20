@@ -4,9 +4,11 @@ import {
   browserAssetUrl,
   browserFileName,
   createBrowserMockBridge,
+  editBrowserMedia,
   openBrowserUrl,
   pickBrowserFile,
   stageBrowserFile,
+  stageBrowserMedia,
 } from "./browser-mock";
 import { SendIdempotency } from "./send-idempotency";
 
@@ -45,6 +47,18 @@ import type {
   ListPinnedMessagesResponse,
   ForwardMessageResponse,
   EditMessageResponse,
+  DeleteMessageResponse,
+  ListStatusesResponse,
+  ListNewslettersResponse,
+  ListNewsletterMessagesResponse,
+  SubscribeNewsletterResponse,
+  SetChatPinResponse,
+  ArchiveChatResponse,
+  MuteChatResponse,
+  BlockChatResponse,
+  StagedMedia,
+  ListStickersResponse,
+  SendStickerFromLibraryResponse,
   SyncStatusResponse,
   RequestOlderHistoryResponse,
   GetChatHistoryCoverageResponse,
@@ -186,6 +200,23 @@ async function invokeCommand<T>(
   }
 }
 
+function requireChatId(chatId: string): void {
+  if (typeof chatId !== "string" || chatId.trim().length === 0) {
+    throw new BridgeError(
+      { code: "invalid_argument", message: "chatId is required", retryable: false },
+    );
+  }
+}
+
+function requireMuteDuration(durationMs: number | null | undefined): void {
+  if (durationMs === null || durationMs === undefined) return;
+  if (typeof durationMs !== "number" || Number.isNaN(durationMs) || durationMs < 0) {
+    throw new BridgeError(
+      { code: "invalid_argument", message: "mute durationMs must be >= 0", retryable: false },
+    );
+  }
+}
+
 /**
  * Subscribe before starting pairing/loading state. Tauri Channel itself
  * restores IPC message order; this small promise chain also prevents async UI
@@ -319,6 +350,15 @@ export async function readClipboardText(): Promise<string> {
   return readText();
 }
 
+/** Persist recorded voice-note bytes to a private temp file and return its path. */
+export async function stageVoiceNote(bytes: Uint8Array, mimeType: string): Promise<string> {
+  if (browserMockEnabled) {
+    const blob = new Blob([new Uint8Array(bytes)], { type: mimeType });
+    return stageBrowserFile(new File([blob], "voice-note", { type: mimeType }));
+  }
+  return invokeCommand<string>("stage_voice_note", { bytes: Array.from(bytes), mimeType });
+}
+
 /** Remove a file created by stageClipboardImage after the backend has consumed it. */
 export async function discardStagedImage(path: string): Promise<void> {
   if (browserMockEnabled) {
@@ -327,6 +367,42 @@ export async function discardStagedImage(path: string): Promise<void> {
     return;
   }
   await invokeCommand<void>("discard_staged_image", { path });
+}
+
+/**
+ * Hand a picked file to the desktop core, which inspects it and copies it
+ * into the profile's staging area. The returned path is the only one the
+ * backend is allowed to read.
+ */
+export async function stageOutgoingMedia(
+  path: string,
+  kind: "image" | "sticker" | "attachment",
+): Promise<StagedMedia> {
+  if (browserMockEnabled) return stageBrowserMedia(path, kind);
+  return invokeCommand<StagedMedia>("stage_outgoing_media", { path, kind });
+}
+
+/**
+ * Crop and rotate a picture. The crop rectangle is expressed in the pixels of
+ * the rotated picture, matching the preview the editor draws.
+ */
+export async function editImage(params: {
+  path: string;
+  rotation: number;
+  cropX: number;
+  cropY: number;
+  cropWidth: number;
+  cropHeight: number;
+}): Promise<StagedMedia> {
+  if (browserMockEnabled) return editBrowserMedia(params);
+  return invokeCommand<StagedMedia>("edit_image", {
+    path: params.path,
+    rotation: params.rotation,
+    cropX: params.cropX,
+    cropY: params.cropY,
+    cropWidth: params.cropWidth,
+    cropHeight: params.cropHeight,
+  });
 }
 
 /** Discover installed Linux browsers and file managers for Settings. */
@@ -408,6 +484,25 @@ export interface BridgeApi {
     messageId: string,
     text: string,
   ): Promise<EditMessageResponse>;
+  deleteMessage(
+    chatId: string,
+    messageId: string,
+    deleteForEveryone: boolean,
+  ): Promise<DeleteMessageResponse>;
+  listStatuses(): Promise<ListStatusesResponse>;
+  subscribeNewsletter(inviteKey: string): Promise<SubscribeNewsletterResponse>;
+  listNewsletters(): Promise<ListNewslettersResponse>;
+  listNewsletterMessages(jid: string, limit?: number): Promise<ListNewsletterMessagesResponse>;
+  unsubscribeNewsletter(jid: string): Promise<{}>;
+  setChatPin(chatId: string, pinned: boolean): Promise<SetChatPinResponse>;
+  archiveChat(chatId: string): Promise<ArchiveChatResponse>;
+  unarchiveChat(chatId: string): Promise<ArchiveChatResponse>;
+  muteChat(chatId: string, durationMs?: number | null): Promise<MuteChatResponse>;
+  unmuteChat(chatId: string): Promise<MuteChatResponse>;
+  blockChat(chatId: string): Promise<BlockChatResponse>;
+  unblockChat(chatId: string): Promise<BlockChatResponse>;
+  listStickers(): Promise<ListStickersResponse>;
+  sendStickerFromLibrary(chatId: string, stickerId: string): Promise<SendStickerFromLibraryResponse>;
   sendImage(
     chatId: string,
     imagePath: string,
@@ -556,6 +651,64 @@ const nativeBridge: BridgeApi = {
     ),
   editMessage: (chatId, messageId, text) =>
     invokeCommand<EditMessageResponse>("edit_message", { chatId, messageId, text }),
+  deleteMessage: (chatId, messageId, deleteForEveryone) =>
+    invokeCommand<DeleteMessageResponse>("delete_message", { chatId, messageId, deleteForEveryone }),
+  listStatuses: () =>
+    invokeCommand<ListStatusesResponse>("list_statuses", {}),
+  subscribeNewsletter: (inviteKey) =>
+    invokeCommand<SubscribeNewsletterResponse>("subscribe_newsletter", { inviteKey }),
+  listNewsletters: () =>
+    invokeCommand<ListNewslettersResponse>("list_newsletters", {}),
+  listNewsletterMessages: (jid, limit = 25) =>
+    invokeCommand<ListNewsletterMessagesResponse>("list_newsletter_messages", { jid, limit }),
+  unsubscribeNewsletter: (jid) =>
+    invokeCommand<{}>("unsubscribe_newsletter", { jid }),
+  setChatPin: (chatId, pinned) =>
+    invokeCommand<SetChatPinResponse>("set_chat_pin", { chatId, pinned }),
+  archiveChat: (chatId) => {
+    requireChatId(chatId);
+    return invokeCommand<ArchiveChatResponse>("archive_chat", { chatId });
+  },
+  unarchiveChat: (chatId) => {
+    requireChatId(chatId);
+    return invokeCommand<ArchiveChatResponse>("unarchive_chat", { chatId });
+  },
+  muteChat: (chatId, durationMs = null) => {
+    requireChatId(chatId);
+    requireMuteDuration(durationMs);
+    return invokeCommand<MuteChatResponse>("mute_chat", { chatId, durationMs });
+  },
+  unmuteChat: (chatId) => {
+    requireChatId(chatId);
+    return invokeCommand<MuteChatResponse>("unmute_chat", { chatId });
+  },
+  blockChat: (chatId) => {
+    requireChatId(chatId);
+    return invokeCommand<BlockChatResponse>("block_chat", { chatId });
+  },
+  unblockChat: (chatId) => {
+    requireChatId(chatId);
+    return invokeCommand<BlockChatResponse>("unblock_chat", { chatId });
+  },
+  listStickers: () => invokeCommand<ListStickersResponse>("list_stickers"),
+  sendStickerFromLibrary: (chatId, stickerId) => {
+    requireChatId(chatId);
+    if (typeof stickerId !== "string" || stickerId.trim().length === 0) {
+      throw new BridgeError(
+        { code: "invalid_argument", message: "stickerId is required", retryable: false },
+      );
+    }
+    return sendIdempotency.run(
+      chatId,
+      ["sticker", `library:${stickerId}`, "", ""],
+      (clientMessageId) =>
+        invokeCommand<SendStickerFromLibraryResponse>("send_sticker_from_library", {
+          clientMessageId,
+          chatId,
+          stickerId,
+        }),
+    );
+  },
   sendImage: (chatId, imagePath, caption = "", replyToMessageId = "", replyToChatId = "") =>
     sendIdempotency.run(
       chatId,

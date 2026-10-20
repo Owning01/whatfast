@@ -1,4 +1,5 @@
 import type { Chat, Message } from "./types";
+import { t } from "./i18n";
 
 const timeFormatter = new Intl.DateTimeFormat(undefined, {
   hour: "numeric",
@@ -50,7 +51,7 @@ export function dayKey(timestampMs: number): string {
 }
 
 export function messageText(message: Message): string {
-  if (message.revoked) return "This message was deleted";
+  if (message.revoked) return t("message.deleted");
   const content = message.content;
   if (!content) return "Message";
   if ("text" in content) return content.text.text;
@@ -79,8 +80,10 @@ export function messageText(message: Message): string {
   return content.unsupported.fallbackText || content.unsupported.typeName || "Message";
 }
 
-export function chatSubtitle(chat: Chat): string {
-  return chat.lastMessagePreview || chat.phoneNumber || "No messages yet";
+export function chatSubtitle(chat: Chat, youPrefix = "You: "): string {
+  const preview = chat.lastMessagePreview || chat.phoneNumber || "No messages yet";
+  if (!chat.lastMessageFromMe || !chat.lastMessagePreview) return preview;
+  return `${youPrefix}${preview}`;
 }
 
 export function initials(name: string): string {
@@ -123,6 +126,18 @@ export function formatDuration(seconds: number): string {
   return hours > 0
     ? `${hours}:${minutes.toString().padStart(2, "0")}:${rest.toString().padStart(2, "0")}`
     : `${minutes}:${rest.toString().padStart(2, "0")}`;
+}
+
+/** Remaining lifetime of a disappearing message, in the compact form used by
+ * the message meta line. */
+export function formatCountdown(milliseconds: number): string {
+  if (milliseconds <= 0) return "0m";
+  const minutes = Math.floor(milliseconds / 60_000);
+  if (minutes < 1) return "<1m";
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  return `${Math.floor(hours / 24)}d`;
 }
 
 export function connectionLabel(connection: number): string {

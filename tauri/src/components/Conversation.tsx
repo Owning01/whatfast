@@ -9,6 +9,7 @@ import {
   MessageCircleMore,
   MoreVertical,
   Search,
+  Trash2,
   UsersRound,
   X,
   Pin,
@@ -18,6 +19,7 @@ import type { Density } from "../state/preferences";
 import { ChatKind, ConnectionState, HistoryCoverageState, SyncPhase, type Message } from "../lib/types";
 import { connectionLabel, dayKey, formatDay, formatTime, messageText } from "../lib/format";
 import { indexMessages } from "../lib/performance";
+import { t } from "../lib/i18n";
 import {
   captureScrollSnapshot,
   resolveScrollRestore,
@@ -59,6 +61,12 @@ export function Conversation(props: { model: AppModel; chatId: string; paneId: s
   const conversation = () => actions.conversation(props.chatId);
   const chat = () => state.chats.find((candidate) => candidate.id === props.chatId);
   const messages = () => conversation().messages;
+  const selectionActive = () => state.selection?.chatId === props.chatId;
+  const selectionCount = () => (selectionActive() ? state.selection?.messageIds.length ?? 0 : 0);
+  const selectionHasOwn = () =>
+    selectionActive() && (state.selection?.messageIds.some((id) =>
+      messages().find((message) => message.id === id)?.fromMe,
+    ) ?? false);
   const historyCoverage = () => conversation().historyCoverage;
   const canRequestOlderHistory = () => {
     const coverage = historyCoverage();
@@ -195,7 +203,13 @@ export function Conversation(props: { model: AppModel; chatId: string; paneId: s
             virtualizer.scrollToIndex(target.index, { align: "end" });
             requestAnimationFrame(() => {
               scrollToLatest();
-              restoringViewport = false;
+              // The first frame may run before the virtualizer has measured
+              // the freshly mounted rows, so the scrollHeight it sees can be
+              // short. A second frame after layout re-asserts the bottom.
+              requestAnimationFrame(() => {
+                scrollToLatest();
+                restoringViewport = false;
+              });
             });
           } else {
             restoringViewport = false;
@@ -252,6 +266,12 @@ export function Conversation(props: { model: AppModel; chatId: string; paneId: s
                         path={value().avatarPath}
                         size={41 * preferences.uiScale}
                         group={value().kind === ChatKind.Group}
+                        onClick={(e) => {
+                          if (value().avatarPath) {
+                            e.stopPropagation();
+                            actions.openImage(value().avatarPath!, value().title || "Foto de perfil", false);
+                          }
+                        }}
                       />
                       <span class="conversation-heading">
                         <strong>{value().title || value().phoneNumber}</strong>
@@ -287,7 +307,7 @@ export function Conversation(props: { model: AppModel; chatId: string; paneId: s
               ref={inChatSearchInput}
               type="search"
               value={searchQuery()}
-              placeholder="Search loaded messages"
+ placeholder={t("conversation.searchPlaceholder")} 
               aria-label="Search loaded messages in this chat"
               onInput={(event) => updateInChatSearch(event.currentTarget.value)}
               onKeyDown={(event) => {
@@ -378,6 +398,23 @@ export function Conversation(props: { model: AppModel; chatId: string; paneId: s
         </div>
         }</Show>
 
+      <Show when={selectionActive()}>
+        <div class="selection-bar" role="toolbar" aria-label="Message selection">
+          <span class="selection-count">{selectionCount()} {t("selection.selected")}</span>
+          <span class="selection-actions">
+            <IconButton label={t("selection.deleteForEveryone")} disabled={!selectionHasOwn()} onClick={() => void actions.deleteSelection(true, props.chatId)}>
+              <Trash2 size={15} />
+            </IconButton>
+            <IconButton label={t("selection.deleteForMe")} onClick={() => void actions.deleteSelection(false, props.chatId)}>
+              <Trash2 size={15} />
+            </IconButton>
+            <IconButton label={t("selection.clear")} onClick={actions.clearMessageSelection}>
+              <X size={15} />
+            </IconButton>
+          </span>
+        </div>
+      </Show>
+
       <div
         ref={scrollRef}
         class="message-scroller"
@@ -431,7 +468,7 @@ export function Conversation(props: { model: AppModel; chatId: string; paneId: s
             )}
           </Match>
           <Match when={messages().length === 0}>
-            <EmptyState title="No messages here yet. Say hello."><MessageCircleMore size={25} /></EmptyState>
+            <EmptyState title={t("conversation.noMessages")}><MessageCircleMore size={25} /></EmptyState>
           </Match>
           <Match when={true}>
           <div class="message-canvas" style={{ height: `${virtualizer.getTotalSize()}px` }}>
@@ -443,9 +480,16 @@ export function Conversation(props: { model: AppModel; chatId: string; paneId: s
                   !previous() || dayKey(previous()!.timestampMs) !== dayKey(message()?.timestampMs ?? 0);
                 const firstUnread = () => message()?.id === conversation().firstUnreadMessageId;
                 // Consecutive incoming group messages from the same sender
-                // within 5 minutes share one avatar/sender line — G1.
-                const grouped = () =>
-                  isGroupedWithPrevious(message(), previous(), isGroup()) && !firstUnread();
+                // within 5 minutes form one burst — G1. The first unread
+                // message always starts a new burst.
+                const continuesBurst = (candidate: Message | undefined, prior: Message | undefined) =>
+                  isGroupedWithPrevious(candidate, prior, isGroup()) &&
+                  candidate?.id !== conversation().firstUnreadMessageId;
+                const grouped = () => continuesBurst(message(), previous());
+                const next = () => messages()[virtualRow.index + 1];
+                // WhatsApp Desktop draws the avatar on the LAST message of a
+                // burst, not on the first one.
+                const endsBurst = () => !continuesBurst(next(), message());
                 const showAvatarGutter = () => isGroup() && Boolean(message()) && !message()!.fromMe;
                 return (
                   <div
@@ -463,10 +507,10 @@ export function Conversation(props: { model: AppModel; chatId: string; paneId: s
                       <div class="date-separator">{formatDay(message()!.timestampMs)}</div>
                     </Show>
                     <Show when={firstUnread()}>
-                      <div class="unread-separator"><span>Unread messages</span></div>
+                      <div class="unread-separator"><span>{t("conversation.unreadSeparator")}</span></div>
                     </Show>
                     <Show when={showAvatarGutter()}>
-                      <Show when={!grouped()} fallback={<div class="message-avatar-spacer" aria-hidden="true" />}>
+                      <Show when={endsBurst()} fallback={<div class="message-avatar-spacer" aria-hidden="true" />}>
                         <GroupAvatar model={props.model} message={message()!} scale={preferences.uiScale} />
                       </Show>
                     </Show>
@@ -480,7 +524,10 @@ export function Conversation(props: { model: AppModel; chatId: string; paneId: s
                             conversation().highlightedMessageId === value().id ||
                             searchHighlight() === value().id
                           }
-                          suppressSender={grouped()}
+                          selectable={selectionActive()}
+                          selected={selectionActive() && (state.selection?.messageIds.includes(value().id) ?? false)}
+                          onToggleSelect={(messageId) => actions.toggleMessageSelection(messageId, props.chatId)}
+                          showSenderName={showAvatarGutter() && !grouped()}
                           quotedMessage={
                             value().replyToMessageId
                               ? (value().replyToChatId && value().replyToChatId !== props.chatId
@@ -558,6 +605,14 @@ export function Conversation(props: { model: AppModel; chatId: string; paneId: s
     captureFrame = window.requestAnimationFrame(() => {
       captureFrame = undefined;
       if (!scrollRef) return;
+      // Top-edge paging must not depend on the virtualizer's onChange sync
+      // semantics (WebView2 does not always emit range changes when the
+      // viewport is already anchored at index 0). Any scroll that lands the
+      // viewport exactly at the top while older history exists pages it in.
+      if (scrollRef.scrollTop <= 0) {
+        const conv = conversation();
+        if (conv.hasOlder && !conv.loadingOlder) void loadOlderAnchored();
+      }
       const distance = scrollRef.scrollHeight - scrollRef.scrollTop - scrollRef.clientHeight;
       if (distance < 80) setNewMessages(0);
       setFarFromBottom(distance > scrollRef.clientHeight * 1.5);
@@ -590,6 +645,10 @@ export function Conversation(props: { model: AppModel; chatId: string; paneId: s
     setSearchOpen(true);
     requestAnimationFrame(() => inChatSearchInput?.focus());
   }
+
+  const focusChatSearchListener = () => openSearch();
+  window.addEventListener("whatfast:focus-chat-search", focusChatSearchListener);
+  onCleanup(() => window.removeEventListener("whatfast:focus-chat-search", focusChatSearchListener));
 
   function closeSearch() {
     setSearchOpen(false);
@@ -676,7 +735,8 @@ function estimateMessageHeight(
   // comfortable density needs the avatar-row floor below.
   const showsAvatarGutter = isGroup && !message.fromMe && !compact;
   let height = compact ? 30 : 48;
-  if (message.senderName && !message.fromMe && !grouped) height += compact ? 13 : 18;
+  // The sender label is printed once per group burst, above the bubble.
+  if (isGroup && message.senderName && !message.fromMe && !grouped) height += compact ? 13 : 18;
   if (message.replyToMessageId) height += compact ? 42 : 55;
   if (message.content) {
     if ("text" in message.content) {

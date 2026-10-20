@@ -21,7 +21,7 @@ WhatsApp Desktop replacement; the exact parity and release gates live in
 SolidJS + TanStack Virtual (Tauri webview)
               typed invoke + ordered Channel events
 Tauri Rust core
-              4-byte BE length + protobuf v20 Envelope
+              4-byte BE length + protobuf v21 Envelope
 Go sidecar (whatsmeow)
               session.db + client.db + bounded media cache
 ```

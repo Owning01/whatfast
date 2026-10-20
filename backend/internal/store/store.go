@@ -303,7 +303,9 @@ CREATE TABLE IF NOT EXISTS chats(
   last_message_at INTEGER NOT NULL DEFAULT 0,
   unread_count INTEGER NOT NULL DEFAULT 0,
   muted_until INTEGER NOT NULL DEFAULT 0,
-  archived INTEGER NOT NULL DEFAULT 0
+  archived INTEGER NOT NULL DEFAULT 0,
+  pinned INTEGER NOT NULL DEFAULT 0,
+  blocked INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS chats_last_message_idx ON chats(last_message_at DESC, jid DESC);
 CREATE TABLE IF NOT EXISTS chat_addresses(
@@ -366,6 +368,12 @@ CREATE TABLE IF NOT EXISTS messages(
   FOREIGN KEY(chat_jid) REFERENCES chats(jid) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS messages_page_idx ON messages(chat_jid, timestamp DESC, id DESC);
+CREATE TABLE IF NOT EXISTS newsletters(
+  jid TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  subscribed_at INTEGER NOT NULL,
+  muted INTEGER NOT NULL DEFAULT 0
+);
 -- Every other messages index leads with chat_jid, so a cross-chat sticker
 -- library scan otherwise reads the whole table. This partial index only
 -- covers sticker rows, which are a small fraction of most accounts' history.
@@ -590,6 +598,24 @@ CREATE INDEX IF NOT EXISTS sticker_favorites_updated_idx ON sticker_favorites(up
 			return fmt.Errorf("add v5 reaction repair cursor id: %w", err)
 		}
 	}
+	hasChatPinned, err := hasColumn(ctx, db, "chats", "pinned")
+	if err != nil {
+		return fmt.Errorf("inspect chats pin schema: %w", err)
+	}
+	if !hasChatPinned {
+		if _, err = db.ExecContext(ctx, `ALTER TABLE chats ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("add chats pin column: %w", err)
+		}
+	}
+	hasChatBlocked, err := hasColumn(ctx, db, "chats", "blocked")
+	if err != nil {
+		return fmt.Errorf("inspect chats block schema: %w", err)
+	}
+	if !hasChatBlocked {
+		if _, err = db.ExecContext(ctx, `ALTER TABLE chats ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("add chats block column: %w", err)
+		}
+	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -795,6 +821,73 @@ func resolveOrCreateChatTx(ctx context.Context, tx *sql.Tx, value string) (strin
 		return "", err
 	}
 	return id, nil
+}
+
+// StatusMessagesSince returns status@broadcast messages newer than the given
+// time, newest first, capped at 500. WhatsApp expires statuses after 24 hours;
+// the caller filters so clients never see stale rows.
+func (s *Store) StatusMessagesSince(ctx context.Context, since time.Time) ([]domain.Message, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id,chat_jid,transport_jid,sender_jid,text,timestamp,from_me,status,kind,reply_to_id,reply_to_chat_id,edited_at,revoked,forwarding_score,
+image_mime,image_caption,image_thumbnail,image_local_path,image_direct_path,image_media_key,image_file_sha256,image_file_enc_sha256,image_width,image_height,image_size,
+image_animated,media_file_name,media_duration,media_voice,contacts_json,location_lat,location_lng,location_name,location_address,location_url,location_live,
+link_preview_url,link_preview_title,link_preview_description,link_preview_thumbnail,link_preview_width,link_preview_height
+FROM messages WHERE transport_jid='status@broadcast' AND timestamp>=? AND kind<>'reaction' ORDER BY timestamp DESC,id DESC LIMIT 500`, since.UnixMilli())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := make([]domain.Message, 0, 64)
+	for rows.Next() {
+		m, _, err := scanStoredMessage(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, m)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	if err = rows.Close(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+func (s *Store) UpsertNewsletter(ctx context.Context, jid, name string) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO newsletters(jid,name,subscribed_at) VALUES(?,?,?)
+		ON CONFLICT(jid) DO UPDATE SET name=excluded.name, subscribed_at=excluded.subscribed_at`,
+		jid, name, time.Now().UnixMilli())
+	return err
+}
+
+func (s *Store) Newsletters(ctx context.Context) ([]domain.Newsletter, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT jid,name,subscribed_at,muted FROM newsletters ORDER BY subscribed_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := make([]domain.Newsletter, 0, 8)
+	for rows.Next() {
+		var item domain.Newsletter
+		var subscribedAt int64
+		if err := rows.Scan(&item.JID, &item.Name, &subscribedAt, &item.Muted); err != nil {
+			return nil, err
+		}
+		item.SubscribedAt = time.UnixMilli(subscribedAt)
+		items = append(items, item)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	if err = rows.Close(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+func (s *Store) RemoveNewsletter(ctx context.Context, jid string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM newsletters WHERE jid=?`, jid)
+	return err
 }
 
 func (s *Store) ResolveChat(ctx context.Context, value string) (string, error) {
@@ -1130,8 +1223,9 @@ retry_after=max(history_coverage.retry_after,excluded.retry_after),detail=exclud
 	if _, err := tx.ExecContext(ctx, `UPDATE chats SET
 name=CASE WHEN name='' THEN (SELECT name FROM chats WHERE jid=?) ELSE name END,
 muted_until=max(muted_until,(SELECT muted_until FROM chats WHERE jid=?)),
-archived=CASE WHEN (SELECT last_message_at FROM chats WHERE jid=?)>last_message_at THEN (SELECT archived FROM chats WHERE jid=?) ELSE archived END
-WHERE jid=?`, loser, loser, loser, loser, winner); err != nil {
+archived=CASE WHEN (SELECT last_message_at FROM chats WHERE jid=?)>last_message_at THEN (SELECT archived FROM chats WHERE jid=?) ELSE archived END,
+blocked=max(blocked,(SELECT blocked FROM chats WHERE jid=?))
+WHERE jid=?`, loser, loser, loser, loser, loser, winner); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM chats WHERE jid=?`, loser); err != nil {
@@ -1154,16 +1248,34 @@ func (s *Store) ChatCount(ctx context.Context) (int64, error) {
 
 func (s *Store) Chat(ctx context.Context, jid string) (domain.Chat, error) {
 	var c domain.Chat
-	var timestamp, muted int64
+	var timestamp, muted, fromMe, pinned, blocked int64
 	id, err := s.ResolveChat(ctx, jid)
 	if err != nil {
 		return c, err
 	}
-	err = s.db.QueryRowContext(ctx, `SELECT jid,preferred_jid,name,last_message_id,last_message_text,last_message_at,unread_count,muted_until,archived FROM chats WHERE jid=?`, id).
-		Scan(&c.JID, &c.AddressJID, &c.Name, &c.LastMessageID, &c.LastMessageText, &timestamp, &c.UnreadCount, &muted, &c.Archived)
+	err = s.db.QueryRowContext(ctx, `SELECT c.jid,c.preferred_jid,c.name,c.last_message_id,c.last_message_text,c.last_message_at,c.unread_count,c.muted_until,c.archived,c.pinned,c.blocked,
+COALESCE(m.from_me,0) AS last_message_from_me
+FROM chats c LEFT JOIN messages m ON m.chat_jid=c.jid AND m.id=c.last_message_id WHERE c.jid=?`, id).
+		Scan(&c.JID, &c.AddressJID, &c.Name, &c.LastMessageID, &c.LastMessageText, &timestamp, &c.UnreadCount, &muted, &c.Archived, &pinned, &blocked, &fromMe)
 	c.LastMessageAt = unixMilli(timestamp)
 	c.MutedUntil = unixMilli(muted)
+	c.LastMessageFromMe = fromMe != 0
+	c.Pinned = pinned != 0
+	c.Blocked = blocked != 0
 	return c, err
+}
+
+func (s *Store) SetChatPinned(ctx context.Context, chatID string, pinned bool) error {
+	id, err := s.ResolveChat(ctx, chatID)
+	if err != nil {
+		return err
+	}
+	value := 0
+	if pinned {
+		value = 1
+	}
+	_, err = s.db.ExecContext(ctx, `UPDATE chats SET pinned=? WHERE jid=?`, value, id)
+	return err
 }
 
 func (s *Store) Chats(ctx context.Context, cursor string, limit int) (domain.Page[domain.Chat], error) {
@@ -1172,8 +1284,14 @@ func (s *Store) Chats(ctx context.Context, cursor string, limit int) (domain.Pag
 		return domain.Page[domain.Chat]{}, fmt.Errorf("decode cursor: %w", err)
 	}
 	limit = clampLimit(limit)
-	rows, err := s.db.QueryContext(ctx, `SELECT jid,preferred_jid,name,last_message_id,last_message_text,last_message_at,unread_count,muted_until,archived
-FROM chats WHERE (last_message_at < ? OR (last_message_at = ? AND jid < ?)) ORDER BY last_message_at DESC,jid DESC LIMIT ?`, ts, ts, id, limit+1)
+	// Status updates and channel subscriptions are surfaced through their own
+	// surfaces (status rings / the channels tab), never as chat rows.
+	rows, err := s.db.QueryContext(ctx, `SELECT c.jid,c.preferred_jid,c.name,c.last_message_id,c.last_message_text,c.last_message_at,c.unread_count,c.muted_until,c.archived,c.pinned,c.blocked,
+COALESCE(m.from_me,0) AS last_message_from_me
+FROM chats c
+LEFT JOIN messages m ON m.chat_jid=c.jid AND m.id=c.last_message_id
+WHERE c.preferred_jid NOT IN ('status@broadcast') AND c.preferred_jid NOT LIKE '%@newsletter'
+AND (c.last_message_at < ? OR (c.last_message_at = ? AND c.jid < ?)) ORDER BY c.last_message_at DESC,c.jid DESC LIMIT ?`, ts, ts, id, limit+1)
 	if err != nil {
 		return domain.Page[domain.Chat]{}, err
 	}
@@ -1182,8 +1300,8 @@ FROM chats WHERE (last_message_at < ? OR (last_message_at = ? AND jid < ?)) ORDE
 	var lastTS int64
 	for rows.Next() {
 		var c domain.Chat
-		var timestamp, muted int64
-		if err := rows.Scan(&c.JID, &c.AddressJID, &c.Name, &c.LastMessageID, &c.LastMessageText, &timestamp, &c.UnreadCount, &muted, &c.Archived); err != nil {
+		var timestamp, muted, fromMe, pinned, blocked int64
+		if err := rows.Scan(&c.JID, &c.AddressJID, &c.Name, &c.LastMessageID, &c.LastMessageText, &timestamp, &c.UnreadCount, &muted, &c.Archived, &pinned, &blocked, &fromMe); err != nil {
 			return page, err
 		}
 		if len(page.Items) == limit {
@@ -1193,14 +1311,19 @@ FROM chats WHERE (last_message_at < ? OR (last_message_at = ? AND jid < ?)) ORDE
 		lastTS = timestamp
 		c.LastMessageAt = unixMilli(timestamp)
 		c.MutedUntil = unixMilli(muted)
+		c.LastMessageFromMe = fromMe != 0
+		c.Pinned = pinned != 0
+		c.Blocked = blocked != 0
 		page.Items = append(page.Items, c)
 	}
 	return page, rows.Err()
 }
 
 func (s *Store) Groups(ctx context.Context) ([]domain.Chat, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT jid,preferred_jid,name,last_message_id,last_message_text,last_message_at,unread_count,muted_until,archived
-FROM chats WHERE preferred_jid LIKE '%@g.us' ORDER BY last_message_at DESC,jid DESC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT c.jid,c.preferred_jid,c.name,c.last_message_id,c.last_message_text,c.last_message_at,c.unread_count,c.muted_until,c.archived,c.pinned,c.blocked,
+COALESCE(m.from_me,0) AS last_message_from_me
+FROM chats c LEFT JOIN messages m ON m.chat_jid=c.jid AND m.id=c.last_message_id
+WHERE c.preferred_jid LIKE '%@g.us' ORDER BY c.last_message_at DESC,c.jid DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -1208,12 +1331,15 @@ FROM chats WHERE preferred_jid LIKE '%@g.us' ORDER BY last_message_at DESC,jid D
 	groups := make([]domain.Chat, 0)
 	for rows.Next() {
 		var chat domain.Chat
-		var timestamp, muted int64
-		if err = rows.Scan(&chat.JID, &chat.AddressJID, &chat.Name, &chat.LastMessageID, &chat.LastMessageText, &timestamp, &chat.UnreadCount, &muted, &chat.Archived); err != nil {
+		var timestamp, muted, fromMe, pinned, blocked int64
+		if err = rows.Scan(&chat.JID, &chat.AddressJID, &chat.Name, &chat.LastMessageID, &chat.LastMessageText, &timestamp, &chat.UnreadCount, &muted, &chat.Archived, &pinned, &blocked, &fromMe); err != nil {
 			return nil, err
 		}
 		chat.LastMessageAt = unixMilli(timestamp)
 		chat.MutedUntil = unixMilli(muted)
+		chat.LastMessageFromMe = fromMe != 0
+		chat.Pinned = pinned != 0
+		chat.Blocked = blocked != 0
 		groups = append(groups, chat)
 	}
 	return groups, rows.Err()
@@ -1227,7 +1353,7 @@ func (s *Store) SearchMessages(ctx context.Context, query string, limit int) ([]
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT m.id,m.chat_jid,m.sender_jid,m.text,m.timestamp,m.from_me,m.kind,
 m.image_caption,m.media_file_name,m.contacts_json,m.location_name,m.location_address,
-c.preferred_jid,c.name,c.last_message_id,c.last_message_text,c.last_message_at,c.unread_count,c.muted_until,c.archived
+c.preferred_jid,c.name,c.last_message_id,c.last_message_text,c.last_message_at,c.unread_count,c.muted_until,c.archived,c.blocked
 FROM message_search JOIN messages m ON m.rowid=message_search.rowid JOIN chats c ON c.jid=m.chat_jid
 WHERE message_search MATCH ? AND m.kind<>'reaction' AND m.revoked=0 ORDER BY rank,m.timestamp DESC LIMIT 256`, strings.Join(trigrams, " OR "))
 	if err != nil {
@@ -1238,15 +1364,16 @@ WHERE message_search MATCH ? AND m.kind<>'reaction' AND m.revoked=0 ORDER BY ran
 	for rows.Next() {
 		var hit domain.MessageSearchHit
 		var imageCaption, fileName, contactsJSON, locationName, locationAddress string
-		var timestamp, chatTimestamp, muted int64
+		var timestamp, chatTimestamp, muted, blocked int64
 		if err = rows.Scan(&hit.MessageID, &hit.Chat.JID, &hit.SenderJID, &hit.Text, &timestamp, &hit.FromMe, &hit.Kind,
 			&imageCaption, &fileName, &contactsJSON, &locationName, &locationAddress,
-			&hit.Chat.AddressJID, &hit.Chat.Name, &hit.Chat.LastMessageID, &hit.Chat.LastMessageText, &chatTimestamp, &hit.Chat.UnreadCount, &muted, &hit.Chat.Archived); err != nil {
+			&hit.Chat.AddressJID, &hit.Chat.Name, &hit.Chat.LastMessageID, &hit.Chat.LastMessageText, &chatTimestamp, &hit.Chat.UnreadCount, &muted, &hit.Chat.Archived, &blocked); err != nil {
 			return nil, err
 		}
 		hit.Timestamp = unixMilli(timestamp)
 		hit.Chat.LastMessageAt = unixMilli(chatTimestamp)
 		hit.Chat.MutedUntil = unixMilli(muted)
+		hit.Chat.Blocked = blocked != 0
 		fields := []struct {
 			value string
 			bonus int
@@ -3070,6 +3197,27 @@ func (s *Store) SetChatMute(ctx context.Context, jid string, mutedUntilMillis in
 		return err
 	}
 	_, err = s.db.ExecContext(ctx, `UPDATE chats SET muted_until=? WHERE jid=?`, mutedUntilMillis, resolved)
+	return err
+}
+
+// SetChatBlocked records whether a chat is on this device's local block list.
+// The block list is device-local: WhatsApp never syncs it, so the flag lives
+// beside the other per-chat preferences. The chat is created if a block
+// mutation arrives before its first message, mirroring SetChatMute, so a
+// blocked contact is not silently unblocked by the first message it sends.
+func (s *Store) SetChatBlocked(ctx context.Context, jid string, blocked bool) error {
+	resolved, err := s.ResolveChat(ctx, jid)
+	if errors.Is(err, sql.ErrNoRows) {
+		resolved, _, err = s.EnsureConversation(ctx, jid)
+	}
+	if err != nil {
+		return err
+	}
+	value := 0
+	if blocked {
+		value = 1
+	}
+	_, err = s.db.ExecContext(ctx, `UPDATE chats SET blocked=? WHERE jid=?`, value, resolved)
 	return err
 }
 

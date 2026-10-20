@@ -3594,6 +3594,38 @@ impl Whatfast {
                         "search-result-list",
                         row_sizes,
                         move |this, visible_range, _, cx| {
+                            if this.store.connection == proto::ConnectionState::Connected
+                                && this.rpc.pending_media_count() < 4
+                            {
+                                for row_index in visible_range.clone() {
+                                    match rows_for_list.get(row_index) {
+                                        Some(SearchResultRow::Contact { source_index, .. }) => {
+                                            if let Some(contact) = this.search_results.contacts.get(*source_index) {
+                                                if !contact.chat_id.is_empty() {
+                                                    let has_avatar = this.store.chat(&contact.chat_id).is_some_and(|c| !c.avatar_path.is_empty());
+                                                    if !has_avatar && !this.avatar_attempted.contains(&contact.chat_id) {
+                                                        this.load_avatar(contact.chat_id.clone());
+                                                    }
+                                                } else if !contact.contact_jid.is_empty() {
+                                                    let has_avatar = this.store.participant_avatar_path(&contact.contact_jid).is_some();
+                                                    if !has_avatar && !this.participant_avatar_attempted.contains(&contact.contact_jid) {
+                                                        this.load_participant_avatar(contact.contact_jid.clone());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Some(SearchResultRow::Group { source_index, .. }) => {
+                                            if let Some(chat) = this.search_results.groups.get(*source_index) {
+                                                let has_avatar = this.store.chat(&chat.id).is_some_and(|c| !c.avatar_path.is_empty()) || !chat.avatar_path.is_empty();
+                                                if !has_avatar && !this.avatar_attempted.contains(&chat.id) {
+                                                    this.load_avatar(chat.id.clone());
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
                             visible_range
                                 .filter_map(|row_index| rows_for_list.get(row_index).cloned())
                                 .filter_map(|row| this.render_search_result_row(row, cx))
@@ -3663,6 +3695,14 @@ impl Whatfast {
                     (true, false) => contact.phone_number.clone(),
                     (true, true) => "WhatsApp contact".into(),
                 };
+                let cached_avatar = if !contact.chat_id.is_empty() {
+                    self.store.chat(&contact.chat_id).map(|c| c.avatar_path.as_str())
+                } else {
+                    None
+                };
+                let avatar_path = cached_avatar
+                    .or_else(|| self.store.participant_avatar_path(&contact.contact_jid))
+                    .unwrap_or("");
                 Some(
                     h_flex()
                         .id(("search-contact", result_index))
@@ -3680,7 +3720,7 @@ impl Whatfast {
                             this.search_highlighted = result_index;
                             this.activate_search_result(window, cx);
                         }))
-                        .child(avatar_element(&contact.display_name, "", px(38.), cx))
+                        .child(avatar_element(&contact.display_name, avatar_path, px(38.), cx))
                         .child(
                             v_flex()
                                 .min_w_0()
@@ -3716,6 +3756,8 @@ impl Whatfast {
                 } else {
                     chat.last_message_preview.clone()
                 };
+                let cached_avatar = self.store.chat(&chat.id).map(|c| c.avatar_path.as_str());
+                let avatar_path = cached_avatar.unwrap_or(chat.avatar_path.as_str());
                 Some(
                     h_flex()
                         .id(("search-group", result_index))
@@ -3733,7 +3775,7 @@ impl Whatfast {
                             this.search_highlighted = result_index;
                             this.activate_search_result(window, cx);
                         }))
-                        .child(avatar_element(&chat.title, "", px(38.), cx))
+                        .child(avatar_element(&chat.title, avatar_path, px(38.), cx))
                         .child(
                             v_flex()
                                 .min_w_0()

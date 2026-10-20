@@ -1,15 +1,22 @@
-import { createEffect, createMemo, createSignal, For, Match, Show, Switch } from "solid-js";
+import { createEffect, createMemo, createSignal, For, Match, onCleanup, Show, Switch } from "solid-js";
+import { Portal } from "solid-js/web";
 import { createVirtualizer } from "@tanstack/solid-virtual";
 import {
   Archive,
+  ArchiveRestore,
   CheckCheck,
   CircleAlert,
   Pin,
+  Plus,
   Search,
+  ShieldAlert,
+  Star,
+  Volume2,
   VolumeX,
   X,
 } from "lucide-solid";
 import type { AppModel, ChatFilter } from "../state/app";
+import { t } from "../lib/i18n";
 import type {
   Chat,
   ContactSearchResult,
@@ -57,6 +64,26 @@ export function Sidebar(props: SidebarProps) {
 
   const searchActive = () => state.searchQuery.trim().length >= 2;
 
+  const [contextMenu, setContextMenu] = createSignal<{ x: number; y: number; chat: Chat } | null>(null);
+
+  createEffect(() => {
+    if (!contextMenu()) return;
+    const close = () => setContextMenu(null);
+    window.addEventListener("click", close);
+    window.addEventListener("contextmenu", close);
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") close();
+    });
+    onCleanup(() => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("contextmenu", close);
+    });
+  });
+
+  createEffect(() => {
+    if (state.chatFilter === "channels") void actions.loadNewsletters();
+  });
+
   createEffect(() => {
     if (searchActive()) return;
     requestAnimationFrame(() => virtualizer.measure());
@@ -64,6 +91,18 @@ export function Sidebar(props: SidebarProps) {
 
   return (
     <aside class="sidebar" aria-label="Chats">
+      <div class="sidebar-header">
+        <h1 class="sidebar-title">Chats</h1>
+        <IconButton
+          label="Nuevo grupo"
+          onClick={() => {
+            const name = window.prompt("Nombre del grupo", "Nuevo grupo");
+            if (name !== null) void actions.createGroup(name);
+          }}
+        >
+          <Plus size={20} />
+        </IconButton>
+      </div>
       <div class="sidebar-search-wrap">
         <label class="search-field">
           <ThemeIcon icon={Search} name="search" size={17} />
@@ -71,8 +110,8 @@ export function Sidebar(props: SidebarProps) {
             ref={props.searchInputRef}
             type="search"
             value={state.searchQuery}
-            placeholder="Search or start a new chat"
-            aria-label="Search contacts, groups, and messages"
+            placeholder={t("sidebar.searchPlaceholder")}
+            aria-label={t("sidebar.searchLabel")}
             onInput={(event) => actions.updateSearch(event.currentTarget.value)}
             onKeyDown={(event) => {
               if (event.key === "Escape") {
@@ -88,7 +127,7 @@ export function Sidebar(props: SidebarProps) {
             }}
           />
           <Show when={state.searchQuery}>
-            <IconButton label="Clear search" class="clear-search" onClick={actions.clearSearch}>
+            <IconButton label={t("sidebar.clearSearch")} class="clear-search" onClick={actions.clearSearch}>
               <ThemeIcon icon={X} name="close" size={16} />
             </IconButton>
           </Show>
@@ -97,14 +136,41 @@ export function Sidebar(props: SidebarProps) {
 
       <Show when={!searchActive()}>
         <div class="chat-filters" role="tablist" aria-label="Chat filters">
-          <FilterButton filter="all" label="All" model={props.model} />
-          <FilterButton filter="unread" label="Unread" model={props.model} />
-          <FilterButton filter="groups" label="Groups" model={props.model} />
-          <FilterButton filter="archived" label="Archived" model={props.model} />
+          <FilterButton filter="all" label={t("sidebar.filter.all")} model={props.model} />
+          <FilterButton filter="unread" label={t("sidebar.filter.unread")} model={props.model} />
+          <FilterButton filter="favorites" label="Favorites" model={props.model} />
+          <FilterButton filter="groups" label={t("sidebar.filter.groups")} model={props.model} />
+          <FilterButton filter="channels" label={t("sidebar.filter.channels")} model={props.model} />
+          <FilterButton filter="archived" label={t("sidebar.filter.archived")} model={props.model} />
         </div>
       </Show>
 
-      <div ref={listRef} class="chat-list" aria-label="Conversation list" hidden={searchActive()}>
+      <Show when={!searchActive() && state.chatFilter === "channels"}>
+        <div class="newsletter-list" role="list" aria-label="Channels">
+          <For each={state.newsletters}>
+            {(newsletter) => (
+              <button
+                type="button"
+                class={`chat-row newsletter-row ${state.selectedNewsletter?.jid === newsletter.jid ? "active" : ""}`}
+                role="listitem"
+                aria-label={newsletter.name}
+                onClick={() => void actions.selectNewsletter(newsletter.jid)}
+              >
+                <span class="avatar" style={{ "--avatar-hue": "160" }}>{newsletter.name.slice(0, 1).toUpperCase()}</span>
+                <span class="chat-row-copy">
+                  <strong>
+                    {newsletter.name}
+                    <Show when={newsletter.local}><span class="role-badge">local</span></Show>
+                  </strong>
+                  <span>Channel{newsletter.muted ? " · muted" : ""}</span>
+                </span>
+              </button>
+            )}
+          </For>
+        </div>
+      </Show>
+
+      <div ref={listRef} class="chat-list" aria-label="Conversation list" hidden={searchActive() || state.chatFilter === "channels"}>
         <Show
           when={chats().length > 0}
           fallback={
@@ -127,7 +193,15 @@ export function Sidebar(props: SidebarProps) {
                     data-index={virtualRow.index}
                     style={{ transform: `translateY(${virtualRow.start}px)`, height: `${virtualRow.size}px` }}
                   >
-                    <Show when={chat()}>{(value) => <ChatRow chat={value()} model={props.model} />}</Show>
+                    <Show when={chat()}>
+                      {(value) => (
+                        <ChatRow
+                          chat={value()}
+                          model={props.model}
+                          onContextMenu={(e, c) => setContextMenu({ x: e.clientX, y: e.clientY, chat: c })}
+                        />
+                      )}
+                    </Show>
                   </div>
                 );
               }}
@@ -170,6 +244,131 @@ export function Sidebar(props: SidebarProps) {
           <button type="button" class="secondary-button" onClick={actions.stopHistorySync}>Cancel</button>
         </Show>
       </div>
+
+      <Show when={contextMenu()}>
+        {(menu) => (
+          <Portal>
+            <div
+              class="context-menu-backdrop"
+              style={{
+                position: "fixed",
+                inset: "0",
+                "z-index": "999998",
+                background: "transparent",
+              }}
+              onMouseDown={() => setContextMenu(null)}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                setContextMenu(null);
+              }}
+            />
+            <div
+              class="chat-context-menu"
+              style={{
+                position: "fixed",
+                top: `${Math.min(menu().y, window.innerHeight - 280)}px`,
+                left: `${Math.min(menu().x, window.innerWidth - 240)}px`,
+                "z-index": "999999",
+              }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <button
+                type="button"
+                class="context-menu-item"
+                onClick={() => {
+                  const c = menu().chat;
+                  setContextMenu(null);
+                  void actions.setChatPinned(c.id, !c.pinned);
+                }}
+              >
+                <Pin size={15} />
+                <span>{menu().chat.pinned ? "Desfijar chat" : "Fijar chat"}</span>
+              </button>
+              <button
+                type="button"
+                class="context-menu-item"
+                onClick={() => {
+                  const c = menu().chat;
+                  setContextMenu(null);
+                  void actions.setChatMuted(c.id, !c.muted);
+                }}
+              >
+                {menu().chat.muted ? <Volume2 size={15} /> : <VolumeX size={15} />}
+                <span>{menu().chat.muted ? "Desilenciar notificaciones" : "Silenciar notificaciones"}</span>
+              </button>
+              <button
+                type="button"
+                class="context-menu-item"
+                onClick={() => {
+                  const c = menu().chat;
+                  setContextMenu(null);
+                  void actions.setChatArchived(c.id, !c.archived);
+                }}
+              >
+                {menu().chat.archived ? <ArchiveRestore size={15} /> : <Archive size={15} />}
+                <span>{menu().chat.archived ? "Desarchivar chat" : "Archivar chat"}</span>
+              </button>
+              <button
+                type="button"
+                class="context-menu-item"
+                onClick={() => {
+                  const c = menu().chat;
+                  setContextMenu(null);
+                  void actions.toggleFavorite(c.id);
+                }}
+              >
+                <Star size={15} />
+                <span>{menu().chat.favorite ? "Quitar de favoritos" : "Añadir a favoritos"}</span>
+              </button>
+              <Show
+                when={menu().chat.unreadCount > 0}
+                fallback={
+                  <button
+                    type="button"
+                    class="context-menu-item"
+                    onClick={() => {
+                      const c = menu().chat;
+                      setContextMenu(null);
+                      actions.markChatUnread(c.id);
+                    }}
+                  >
+                    <CheckCheck size={15} />
+                    <span>Marcar como no leído</span>
+                  </button>
+                }
+              >
+                <button
+                  type="button"
+                  class="context-menu-item"
+                  onClick={() => {
+                    const c = menu().chat;
+                    setContextMenu(null);
+                    void actions.markChatRead(c.id);
+                  }}
+                >
+                  <CheckCheck size={15} />
+                  <span>Marcar como leído</span>
+                </button>
+              </Show>
+              <Show when={menu().chat.kind !== ChatKind.Group}>
+                <div class="chat-context-divider" />
+                <button
+                  type="button"
+                  class="context-menu-item danger"
+                  onClick={() => {
+                    const c = menu().chat;
+                    setContextMenu(null);
+                    void actions.setChatBlocked(c.id, !c.blocked);
+                  }}
+                >
+                  <ShieldAlert size={15} />
+                  <span>{menu().chat.blocked ? "Desbloquear contacto" : "Bloquear contacto"}</span>
+                </button>
+              </Show>
+            </div>
+          </Portal>
+        )}
+      </Show>
     </aside>
   );
 }
@@ -188,7 +387,11 @@ function FilterButton(props: { filter: ChatFilter; label: string; model: AppMode
   );
 }
 
-function ChatRow(props: { chat: Chat; model: AppModel }) {
+function ChatRow(props: {
+  chat: Chat;
+  model: AppModel;
+  onContextMenu?: (event: MouseEvent, chat: Chat) => void;
+}) {
   const { state, actions, preferences, prefActions } = props.model;
   const typing = () => actions.typingLabel(props.chat.id);
   // A chat counts as open when any pane holds it, not only the focused one.
@@ -200,6 +403,11 @@ function ChatRow(props: { chat: Chat; model: AppModel }) {
       type="button"
       class={`chat-row ${open() ? "selected" : ""} ${props.chat.unreadCount > 0 ? "unread" : ""}`}
       aria-current={state.selectedChatId === props.chat.id ? "page" : undefined}
+      onContextMenu={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        props.onContextMenu?.(event, props.chat);
+      }}
       onClick={(event) => {
         // Ctrl/Cmd-click matches the browser convention the tab strip sets up.
         if (event.ctrlKey || event.metaKey) actions.openInNewTab(props.chat.id);
@@ -227,11 +435,12 @@ function ChatRow(props: { chat: Chat; model: AppModel }) {
         </span>
         <span class="chat-row-line">
           <span class={`chat-preview ${typing() ? "typing" : ""}`}>
-            {typing() || chatSubtitle(props.chat)}
+            {typing() || chatSubtitle(props.chat, t("chat.youPrefix"))}
           </span>
           <span class="chat-flags">
             <Show when={props.chat.muted}><VolumeX size={14} /></Show>
-            <Show when={props.chat.pinned}><Pin size={13} /></Show>
+            <Show when={props.chat.favorite}><Star size={13} /></Show>
+            <Show when={props.chat.pinned}><Pin size={14} class="pin-active-badge" /></Show>
             <Show when={props.chat.unreadCount > 0}>
               <span class="chat-badge">{props.chat.unreadCount > 99 ? "99+" : props.chat.unreadCount}</span>
             </Show>
@@ -321,20 +530,57 @@ function SearchResultRow(props: {
   model: AppModel;
   onActivate: () => void;
 }) {
-  const title = () =>
-    props.row.type === "contact"
-      ? props.row.result.displayName
-      : props.row.type === "group"
-        ? props.row.result.title
-        : props.row.result.chatTitle;
-  const subtitle = () =>
-    props.row.type === "contact"
-      ? props.row.result.phoneNumber || props.row.result.secondaryName
-      : props.row.type === "group"
-        ? props.row.result.lastMessagePreview
-        : `${props.row.result.senderName ? `${props.row.result.senderName}: ` : ""}${props.row.result.snippet}`;
-  const avatarPath = () =>
-    props.row.type === "group" ? props.row.result.avatarPath : "";
+  const { state, actions } = props.model;
+
+  createEffect(() => {
+    const row = props.row;
+    if (row.type === "contact") {
+      const contact = row.result;
+      const contactJid = contact.contactJid;
+      if (contactJid && !state.participantAvatars[contactJid]) {
+        const cancel = actions.loadParticipantAvatar(contactJid, "search");
+        onCleanup(cancel);
+      }
+      if (contact.chatId) {
+        actions.loadAvatar(contact.chatId);
+      }
+    } else if (row.type === "group") {
+      actions.loadAvatar(row.result.id);
+    }
+  });
+
+  const title = () => {
+    const row = props.row;
+    if (row.type === "contact") return row.result.displayName;
+    if (row.type === "group") return row.result.title;
+    return row.result.chatTitle;
+  };
+  const subtitle = () => {
+    const row = props.row;
+    if (row.type === "contact") {
+      return row.result.phoneNumber || row.result.secondaryName;
+    }
+    if (row.type === "group") {
+      return row.result.lastMessagePreview;
+    }
+    return `${row.result.senderName ? `${row.result.senderName}: ` : ""}${row.result.snippet}`;
+  };
+  const avatarPath = () => {
+    const row = props.row;
+    if (row.type === "contact") {
+      const contact = row.result;
+      if (contact.chatId) {
+        const chat = state.chats.find((c) => c.id === contact.chatId);
+        if (chat?.avatarPath) return chat.avatarPath;
+      }
+      return (contact.contactJid && state.participantAvatars[contact.contactJid]) || "";
+    }
+    if (row.type === "group") {
+      const groupChat = state.chats.find((c) => c.id === row.result.id);
+      return groupChat?.avatarPath || row.result.avatarPath || "";
+    }
+    return "";
+  };
 
   return (
     <button
@@ -362,12 +608,16 @@ function SearchResultRow(props: {
 function emptyLabel(filter: ChatFilter): string {
   switch (filter) {
     case "unread":
-      return "You're all caught up";
+      return t("sidebar.noUnread");
+    case "favorites":
+      return "No favorite chats yet";
     case "groups":
-      return "No groups loaded";
+      return t("sidebar.noGroups");
+    case "channels":
+      return t("sidebar.noChannels");
     case "archived":
-      return "No archived chats";
+      return t("sidebar.noArchived");
     default:
-      return "No chats yet";
+      return t("sidebar.noChats");
   }
 }

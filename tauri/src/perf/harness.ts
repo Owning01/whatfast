@@ -148,18 +148,25 @@ async function hydrateFixture(): Promise<void> {
     "all 1,000 participants",
   );
   const scroller = requiredElement<HTMLElement>(".message-scroller");
-  // Forty 50-row pages cover the complete 2,000-message fixture. Wait for
-  // each page rather than relying on timing so a slow IPC round trip cannot
-  // make the next top-edge event disappear behind the in-flight guard.
+  // Forty 50-row pages cover the complete 2,000-message fixture. The
+  // anchor-restore rAF that follows a page can land after a programmatic
+  // scrollTop=0 and pull the viewport off the top edge again, so re-assert
+  // the top edge every 250ms while waiting. A live fixture message only
+  // grows the count by one, so require a real page (>1 row) to continue.
   for (let page = 0; page < 44 && window.__WHATFAST_PERF_INSPECT__!.messageCount() < 2_000; page += 1) {
     const before = window.__WHATFAST_PERF_INSPECT__!.messageCount();
-    scroller.scrollTop = 0;
-    scroller.dispatchEvent(new Event("scroll"));
-    await waitFor(
-      () => window.__WHATFAST_PERF_INSPECT__!.messageCount() > before,
-      2_000,
-      `message page after ${before} rows`,
-    );
+    const deadline = performance.now() + 2_000;
+    while (
+      window.__WHATFAST_PERF_INSPECT__!.messageCount() <= before + 1
+      && performance.now() < deadline
+    ) {
+      scroller.scrollTop = 0;
+      scroller.dispatchEvent(new Event("scroll"));
+      await delay(250);
+    }
+    if (window.__WHATFAST_PERF_INSPECT__!.messageCount() <= before + 1) {
+      throw new Error(`performance fixture did not page older messages (stuck at ${before} rows)`);
+    }
   }
   if (window.__WHATFAST_PERF_INSPECT__!.messageCount() !== 2_000) {
     throw new Error("performance fixture did not hydrate all 2,000 messages");

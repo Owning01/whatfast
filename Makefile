@@ -95,7 +95,7 @@ backend:
 
 backend-release:
 	mkdir -p $(BUILD_DIR)
-	cd backend && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $(BACKEND_BIN) ./cmd/whatfast-backend
+	cd backend && CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w" -o $(BACKEND_BIN) ./cmd/whatfast-backend
 
 frontend-build: deps
 	pnpm --dir $(TAURI_DIR) build
@@ -124,7 +124,7 @@ guard-linux:
 
 sidecar-linux: guard-linux
 	mkdir -p $(TAURI_CRATE_DIR)/binaries
-	cd backend && CGO_ENABLED=0 GOOS=linux GOARCH=$(LINUX_GOARCH) go build -trimpath -ldflags="-s -w" -o ../$(LINUX_SIDECAR) ./cmd/whatfast-backend
+	cd backend && CGO_ENABLED=0 GOOS=linux GOARCH=$(LINUX_GOARCH) go build -trimpath -buildvcs=false -ldflags="-s -w" -o ../$(LINUX_SIDECAR) ./cmd/whatfast-backend
 
 release: release-linux
 
@@ -132,20 +132,13 @@ release-linux: check sidecar-linux
 	pnpm --dir $(TAURI_DIR) tauri build --target $(LINUX_TARGET) --bundles deb --config src-tauri/tauri.bundle.conf.json
 	@echo "Linux package: $(LINUX_BUNDLE_DIR)"
 
-legacy-check:
-	cd desktop && cargo check --tests --locked
+legacy-check: tauri-check
 
-legacy-test:
-	cd desktop && cargo test --locked
+legacy-test: tauri-test
 
-legacy-build: backend
-	cd desktop && cargo build --locked
-	cp $(BACKEND_BIN) desktop/target/debug/whatfast-backend$(EXE_EXT)
+legacy-build: build
 
-legacy-release: backend-release
-	mkdir -p desktop/target/release
-	cd desktop && cargo build --release --locked
-	cp $(BACKEND_BIN) desktop/target/release/whatfast-backend$(EXE_EXT)
+legacy-release: release
 
 clean:
 	cd backend && go clean
